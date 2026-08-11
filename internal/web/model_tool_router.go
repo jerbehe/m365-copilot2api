@@ -60,6 +60,13 @@ func parseModelToolDecision(text string, tools []map[string]any, choice any) ([]
 	if strings.Contains(text, "NO_TOOL_NEEDED") || strings.Contains(text, "no_tool_needed") {
 		return nil, true
 	}
+	// The model sometimes answers with the client's own fenced call syntax
+	// (```exec { ... }```) instead of the requested envelope. Recover those calls
+	// here: otherwise the block falls through and is forwarded as assistant
+	// prose, which ends the turn without any tool call.
+	if calls := fencedToolCalls(text, tools, choice); len(calls) > 0 {
+		return calls, true
+	}
 	// Fallback: try the old JSON format
 	if i := strings.Index(text, "```"); i >= 0 {
 		text = strings.TrimSpace(strings.TrimPrefix(strings.TrimSuffix(text[i+3:], "```"), "json"))
@@ -68,17 +75,22 @@ func parseModelToolDecision(text string, tools []map[string]any, choice any) ([]
 	if start < 0 || end <= start {
 		return nil, false
 	}
+	// Calls is a pointer so a missing "calls" key is distinguishable from an
+	// explicitly empty list. encoding/json ignores unknown fields, so any JSON
+	// object — a bare argument payload, an upstream error blob — used to decode
+	// cleanly into an empty envelope and be reported as a valid "no tool needed"
+	// decision, silently dropping the real call.
 	var envelope struct {
-		Calls []struct {
+		Calls *[]struct {
 			Name      string         `json:"name"`
 			Arguments map[string]any `json:"arguments"`
 		} `json:"calls"`
 	}
-	if json.Unmarshal([]byte(text[start:end+1]), &envelope) != nil {
+	if json.Unmarshal([]byte(text[start:end+1]), &envelope) != nil || envelope.Calls == nil {
 		return nil, false
 	}
-	out := make([]detectedToolCall, 0, len(envelope.Calls))
-	for i, c := range envelope.Calls {
+	out := make([]detectedToolCall, 0, len(*envelope.Calls))
+	for i, c := range *envelope.Calls {
 		fn := toolFunction(c.Name, tools)
 		if fn == nil || c.Arguments == nil || !toolChoiceAllows(choice, c.Name) || schemaValid(c.Arguments, fn) != nil {
 			continue

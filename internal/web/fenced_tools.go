@@ -6,19 +6,50 @@ import (
 	"strings"
 )
 
-var fencedToolCall = regexp.MustCompile("(?s)```([A-Za-z0-9_-]+)\\s*\\n(.*?)\\n```")
+// fencedToolCall matches a fenced block whose info string names a tool. The
+// closing fence is optional and may follow the body without a newline: upstream
+// truncates long answers mid-block, and a strict pattern used to leave the whole
+// block unparsed, which then leaked raw tool syntax into the assistant text.
+var fencedToolCall = regexp.MustCompile("(?s)```([A-Za-z0-9_-]+)[ \t]*\r?\n(.*?)(?:\r?\n?```|$)")
+
+// shellFenceNames are the info strings that denote a shell command block rather
+// than a tool named after itself.
+var shellFenceNames = []string{"bash", "sh", "shell", "powershell", "cmd"}
+
+func isShellFenceName(name string) bool {
+	for _, n := range shellFenceNames {
+		if name == n {
+			return true
+		}
+	}
+	return false
+}
 
 // declaredShell returns the shell-ish tool name the client actually
 // declared (bash/sh/shell/powershell/cmd), or "" if none. Forcing an
 // undeclared bash call on clients that don't support it (issue #12) makes
 // them error out and loop, so conversion only happens for declared tools.
 func declaredShell(allowed map[string]bool) string {
-	for _, n := range []string{"bash", "sh", "shell", "powershell", "cmd"} {
+	for _, n := range shellFenceNames {
 		if allowed[n] {
 			return n
 		}
 	}
 	return ""
+}
+
+// isCustomTool reports whether a declared tool uses the grammar-constrained
+// custom shape (Codex `exec`), whose body is a raw string rather than a JSON
+// argument object.
+func isCustomTool(name string, tools []map[string]any) bool {
+	return toolType(name, tools) == "custom"
+}
+
+// looksLikeJSONObject reports whether a fence body was meant to be a JSON
+// argument object. A body that opens with `{` but fails to parse is a truncated
+// or garbled call: it must never be turned into a fabricated argument value.
+func looksLikeJSONObject(body string) bool {
+	return strings.HasPrefix(body, "{")
 }
 
 func fencedToolCalls(text string, tools []map[string]any, choice any) []detectedToolCall {
@@ -29,10 +60,10 @@ func fencedToolCalls(text string, tools []map[string]any, choice any) []detected
 		name := m[1]
 		args := strings.TrimSpace(m[2])
 		var v any
-		_ = json.Unmarshal([]byte(args), &v)
+		parsed := json.Unmarshal([]byte(args), &v) == nil
 		// Auto-convert bash/shell code blocks to tool calls, but only when
 		// the client declared the tool.
-		if name == "bash" || name == "sh" || name == "shell" || name == "powershell" || name == "cmd" {
+		if isShellFenceName(name) {
 			converted := name
 			if !allowed[name] {
 				if shell == "" {
@@ -47,17 +78,36 @@ func fencedToolCalls(text string, tools []map[string]any, choice any) []detected
 					continue
 				}
 			}
-			if v == nil {
+			if !parsed && args != "" && !looksLikeJSONObject(args) {
 				cmdBytes, _ := json.Marshal(map[string]any{"command": args})
 				out = append(out, detectedToolCall{ID: callID(converted, string(cmdBytes), len(out)), Type: "function", Name: converted, Arguments: cmdBytes})
 				continue
 			}
 			continue
 		}
-		if !allowed[name] || !toolChoiceAllows(choice, name) {
+		if !allowed[name] || !toolChoiceAllows(choice, name) || args == "" {
 			continue
 		}
-		if v == nil {
+		// Grammar-constrained custom tools carry a raw script. Accept both the
+		// bridged {"input":"..."} object and a bare body.
+		if isCustomTool(name, tools) {
+			if obj, ok := v.(map[string]any); ok {
+				if in, hasInput := obj["input"].(string); hasInput && in != "" {
+					b, _ := json.Marshal(map[string]any{"input": in})
+					out = append(out, detectedToolCall{ID: callID(name, string(b), len(out)), Type: "custom", Name: name, Arguments: b})
+				}
+				continue
+			}
+			if looksLikeJSONObject(args) {
+				// Truncated or garbled JSON: emitting it as a raw script would
+				// run broken code, so drop the call and let the caller retry.
+				continue
+			}
+			b, _ := json.Marshal(map[string]any{"input": args})
+			out = append(out, detectedToolCall{ID: callID(name, string(b), len(out)), Type: "custom", Name: name, Arguments: b})
+			continue
+		}
+		if !parsed || v == nil {
 			continue
 		}
 		b, _ := json.Marshal(v)
@@ -93,4 +143,49 @@ func fencedToolCalls(text string, tools []map[string]any, choice any) []detected
 		}
 	}
 	return out
+}
+
+// withheldToolFenceNotice replaces prose that consisted solely of unusable tool
+// syntax. An empty assistant message would be rejected downstream as an empty
+// upstream response, so state plainly that no call could be issued.
+const withheldToolFenceNotice = "上游返回的是无法执行的工具调用语法，没有产生有效的工具调用。请重试当前请求。"
+
+// stripToolFences removes fenced blocks that name a declared tool from text that
+// is about to be forwarded as assistant prose, reporting whether anything was
+// withheld. Tool syntax must never reach the client as an ordinary message: a
+// leaked ```exec block ends the turn without a tool call, so the client shows a
+// wall of script and then stalls.
+func stripToolFences(text string, tools []map[string]any) (string, bool) {
+	allowed := allowedToolNames(tools)
+	shell := declaredShell(allowed)
+	var b strings.Builder
+	last := 0
+	withheld := false
+	for _, loc := range fencedToolCall.FindAllStringSubmatchIndex(text, -1) {
+		name := text[loc[2]:loc[3]]
+		if !allowed[name] && !(isShellFenceName(name) && shell != "") {
+			continue
+		}
+		b.WriteString(text[last:loc[0]])
+		last = loc[1]
+		withheld = true
+	}
+	if !withheld {
+		return text, false
+	}
+	b.WriteString(text[last:])
+	return b.String(), true
+}
+
+// withholdToolFences strips tool syntax from an assistant answer, substituting a
+// notice when nothing usable remains.
+func withholdToolFences(text string, tools []map[string]any) (string, bool) {
+	stripped, withheld := stripToolFences(text, tools)
+	if !withheld {
+		return text, false
+	}
+	if strings.TrimSpace(stripped) == "" {
+		return withheldToolFenceNotice, true
+	}
+	return stripped, true
 }

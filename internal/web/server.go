@@ -1241,9 +1241,9 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			text.WriteString(ev.Text)
 			pending.WriteString(ev.Text)
 			v := pending.String()
-			// If the text contains a bash block or a JSON command, don't emit it as text
-			// It will be caught by fencedToolCalls after the stream completes
-			if strings.Contains(v, "```bash") || strings.Contains(v, "\"command\"") {
+			// A JSON command payload outside a fence is a shell call in disguise;
+			// hold it back so fencedToolCalls can claim it after the stream ends.
+			if strings.Contains(v, "\"command\"") {
 				return nil
 			}
 			if i := strings.Index(v, "```"); i >= 0 {
@@ -1304,7 +1304,21 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			s.bindConversation(acc, &body, r, res, answerPrompt, startedAt)
 			return
 		}
-		if err := emitText(pending.String()); err != nil {
+		// Whatever is still buffered may hold a fenced tool call that no parser
+		// claimed (truncated body, garbled JSON). Forwarding it as prose ends the
+		// turn with a wall of raw tool syntax and no call, so strip those blocks
+		// and emit only the surrounding text.
+		tail, withheld := stripToolFences(pending.String(), toolMaps)
+		if withheld {
+			log.Printf("[req-trace] id=%s stage=stream_fence_withheld pending=%d emitted=%d", requestID, pending.Len(), len(tail))
+			// `first` is still set when every delta so far was held back, meaning
+			// the whole answer was tool syntax. An empty stream looks like a hang,
+			// so say why no call was produced.
+			if first && strings.TrimSpace(tail) == "" {
+				tail = withheldToolFenceNotice
+			}
+		}
+		if err := emitText(tail); err != nil {
 			log.Printf("[req-trace] id=%s stage=stream_write err=%v", requestID, err)
 			return
 		}
@@ -1536,6 +1550,13 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 	}
 	if !completionEvidenceAllows(res.Text, ledger) {
 		res.Text = "I cannot confirm completion because no matching tool results were returned. No external action has been verified."
+	}
+	// No parser claimed a call by this point. Any remaining fenced block naming a
+	// declared tool is unusable tool syntax, not an answer, so withhold it rather
+	// than hand the client a script it will render as prose.
+	if stripped, withheld := withholdToolFences(res.Text, toolMaps); withheld {
+		log.Printf("[req-trace] id=%s stage=fence_withheld original=%d emitted=%d", requestID, len(res.Text), len(stripped))
+		res.Text = stripped
 	}
 	log.Printf("[debug] res.Text bytes=%d content=%q", len(res.Text), res.Text)
 	created := time.Now().Unix()
