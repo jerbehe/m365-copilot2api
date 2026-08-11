@@ -177,11 +177,14 @@ func (s *Server) adminMiddleware(next http.Handler) http.Handler {
 			return
 		}
 		if strings.HasPrefix(r.URL.Path, "/v1/") {
-			if !s.validAPIKey(r) {
+			matched, ok := s.matchAPIKey(r)
+			if !ok {
 				http.Error(w, `{"error":{"message":"valid API key required","type":"auth_error"}}`, http.StatusUnauthorized)
 				return
 			}
-			next.ServeHTTP(w, r)
+			// Usage and cache accounting must attribute the request to the key that
+			// actually authenticated it, not to whichever header came first.
+			next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), apiKeyContextKey{}, matched)))
 			return
 		}
 		if s.adminPassword == "" {
@@ -362,15 +365,33 @@ func (s *Server) adminKeys(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", 405)
 	}
 }
-func (s *Server) validAPIKey(r *http.Request) bool {
-	raw := strings.TrimSpace(r.Header.Get("X-API-Key"))
-	if raw == "" {
-		v := r.Header.Get("Authorization")
-		if strings.HasPrefix(strings.ToLower(v), "bearer ") {
-			raw = strings.TrimSpace(v[7:])
+
+// apiKeyCandidates returns every credential a client offered, in priority order.
+// Clients such as Claude Code send both headers at once — x-api-key carrying a
+// stale key from a previous provider and Authorization carrying the configured
+// ANTHROPIC_AUTH_TOKEN — so a single-header check would reject a request that
+// does present a valid key.
+func apiKeyCandidates(r *http.Request) []string {
+	var out []string
+	if v := strings.TrimSpace(r.Header.Get("X-API-Key")); v != "" {
+		out = append(out, v)
+	}
+	if v := r.Header.Get("Authorization"); strings.HasPrefix(strings.ToLower(v), "bearer ") {
+		if raw := strings.TrimSpace(v[7:]); raw != "" {
+			out = append(out, raw)
 		}
 	}
-	return raw != "" && s.apiKeys.valid(raw)
+	return out
+}
+
+// matchAPIKey returns the offered credential that is actually a live API key.
+func (s *Server) matchAPIKey(r *http.Request) (string, bool) {
+	for _, raw := range apiKeyCandidates(r) {
+		if s.apiKeys.valid(raw) {
+			return raw, true
+		}
+	}
+	return "", false
 }
 
 func jsonOut(w http.ResponseWriter, v any) {
@@ -1631,15 +1652,35 @@ func (s *Server) bindConversation(acc auth.AccountToken, body *oaiReq, r *http.R
 	})
 }
 
-func extractAPIKey(r *http.Request) string {
-	key := strings.TrimSpace(r.Header.Get("X-API-Key"))
+// apiKeyContextKey carries the API key that authenticated the current request.
+type apiKeyContextKey struct{}
+
+// authenticatedAPIKey returns the raw credential the auth middleware validated.
+func authenticatedAPIKey(r *http.Request) string {
+	key, _ := r.Context().Value(apiKeyContextKey{}).(string)
 	if key != "" {
 		return key
 	}
-	auth := r.Header.Get("Authorization")
-	if strings.HasPrefix(strings.ToLower(auth), "bearer ") {
-		key = strings.TrimSpace(auth[7:])
+	if candidates := apiKeyCandidates(r); len(candidates) > 0 {
+		return candidates[0]
 	}
+	return ""
+}
+
+// apiKeyTenant is the isolation key for per-caller server state. It hashes the
+// full credential: a truncated prefix would let two distinct keys sharing eight
+// leading characters read each other's stored responses.
+func apiKeyTenant(r *http.Request) string {
+	raw := authenticatedAPIKey(r)
+	if raw == "" {
+		return ""
+	}
+	return keyHash(raw)
+}
+
+// extractAPIKey returns a truncated identifier for usage accounting and logs.
+func extractAPIKey(r *http.Request) string {
+	key := authenticatedAPIKey(r)
 	if len(key) > 8 {
 		return key[:8] + "..."
 	}

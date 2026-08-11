@@ -32,6 +32,7 @@ var advertisedReasoningEfforts = []reasoningEffortPreset{
 	{Effort: "medium", Description: "Balances speed and reasoning depth for everyday tasks."},
 	{Effort: "high", Description: "Greater reasoning depth for complex problems."},
 	{Effort: "xhigh", Description: "Extra high reasoning depth for complex problems."},
+	{Effort: "max", Description: "Maximum reasoning depth for the most complex problems."},
 }
 
 // gatewayCodexBaseInstructions is returned only in the Codex model catalog.
@@ -143,10 +144,10 @@ func normalizeReasoningEffort(e string) (string, error) {
 		return "", nil
 	}
 	switch e {
-	case "none", "minimal", "low", "medium", "high", "xhigh":
+	case "none", "minimal", "low", "medium", "high", "xhigh", "max":
 		return e, nil
 	}
-	return "", fmt.Errorf("unsupported reasoning effort %q; use none, minimal, low, medium, high, or xhigh", e)
+	return "", fmt.Errorf("unsupported reasoning effort %q; use none, minimal, low, medium, high, xhigh, or max", e)
 }
 func reasoningTone(model, effort string) (string, error) {
 	e, err := normalizeReasoningEffort(effort)

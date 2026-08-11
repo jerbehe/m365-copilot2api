@@ -174,6 +174,15 @@ func TestReasoningEffortRouting(t *testing.T) {
 	}
 }
 
+func TestNormalizeReasoningEffortAcceptsMaximumLevels(t *testing.T) {
+	for _, effort := range []string{"xhigh", "max"} {
+		got, err := normalizeReasoningEffort(effort)
+		if err != nil || got != effort {
+			t.Fatalf("effort=%q got=%q err=%v", effort, got, err)
+		}
+	}
+}
+
 func TestChatRejectsInvalidReasoningBeforeUpstream(t *testing.T) {
 	s := &Server{}
 	r := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"gpt-5.6-reasoning","reasoning_effort":"extreme","messages":[{"role":"user","content":"hello"}]}`))

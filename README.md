@@ -1,5 +1,7 @@
 # M365 Copilot2API
 
+> 分叉自 [https://github.com/HEXUXIU/M365-Copilot2API](https://github.com/HEXUXIU/M365-Copilot2API)
+
 > 本 README 为项目主文档，使用中文维护。Web 控制台的中英文 i18n 仅用于控制台界面语言切换。
 
 <p align="center">
@@ -95,7 +97,7 @@ M365 Copilot2API 是一个用 Go 编写的自托管网关，把微软 365 Copilo
 ### 源码编译
 
 ```powershell
-git clone https://github.com/HEXUXIU/M365-Copilot2API.git
+git clone https://github.com/jerbehe/m365-copilot2api.git
 cd M365-Copilot2API
 
 # 设置管理员密码（可选，默认 admin123），生产环境务必设置强密码

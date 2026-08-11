@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
@@ -221,28 +222,8 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 		}
 		return nil
 	}
-	// ChatHub signals text either as a full snapshot or as cursor rewrites.
-	// Only the portion not already streamed may be emitted; naive prefix
-	// checks misfire when upstream rewrites the whole buffer, which duplicated
-	// answers (AAA…). Match any overlap and emit the tail.
 	emitSnapshot := func(snapshot string) error {
-		if snapshot == "" {
-			return nil
-		}
-		cur := streamed.String()
-		if cur == "" {
-			return emitDelta(snapshot)
-		}
-		if strings.HasPrefix(snapshot, cur) {
-			return emitDelta(strings.TrimPrefix(snapshot, cur))
-		}
-		if i := strings.Index(snapshot, cur); i >= 0 {
-			return emitDelta(snapshot[i+len(cur):])
-		}
-		if len(snapshot) > len(cur) && strings.HasSuffix(snapshot, cur) {
-			return emitDelta(snapshot[:len(snapshot)-len(cur)])
-		}
-		return emitDelta(snapshot)
+		return emitDelta(snapshotDelta(streamed.String(), snapshot))
 	}
 	var final string
 	var throttling any
@@ -301,6 +282,12 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 					if !ok {
 						continue
 					}
+					// ChatHub may append a document-revision frame after the answer.
+					// Its payload contains the complete answer again and must never be
+					// forwarded as a new text delta.
+					if isDocumentRevisionFrame(arg) {
+						continue
+					}
 					msgs, _ := arg["messages"].([]any)
 					if onEvent != nil {
 						for _, ev := range extractToolEvents(arg, seenStreamTools) {
@@ -333,7 +320,7 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 						}
 					}
 					if w, ok := arg["writeAtCursor"].(string); ok && w != "" && !toolFrame {
-						if err := emitSnapshot(w); err != nil {
+						if err := emitDelta(w); err != nil {
 							return Result{}, err
 						}
 					}
@@ -409,6 +396,96 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 	// an incomplete upstream response. Do not return accumulated deltas as if
 	// they were a successful, finished answer.
 	return Result{}, fmt.Errorf("chathub response deadline exceeded before completion")
+}
+
+// snapshotDelta returns the part of an authoritative ChatHub snapshot that has
+// not been streamed yet.
+//
+// ChatHub carries answer text in two distinct frame shapes that must never share
+// one heuristic:
+//
+//	writeAtCursor — a pure incremental chunk appended at the cursor. It is
+//	  always new text, even when it repeats what was just emitted ("常" arriving
+//	  right after text already ending in "常"), so it is forwarded verbatim.
+//	  Overlap matching used to swallow such chunks, desynchronising the local
+//	  buffer until the next snapshot looked unrelated and the whole answer was
+//	  re-emitted (AAA…).
+//
+//	bot message text — a full snapshot of the answer so far, handled here.
+//	  Upstream keeps these monotonic, so only the suffix beyond what was already
+//	  streamed may be emitted.
+func snapshotDelta(streamed, snapshot string) string {
+	if snapshot == "" {
+		return ""
+	}
+	if streamed == "" {
+		return snapshot
+	}
+	if strings.HasPrefix(snapshot, streamed) {
+		return snapshot[len(streamed):]
+	}
+	if strings.HasPrefix(streamed, snapshot) {
+		// Stale or partial snapshot; everything in it was already streamed.
+		return ""
+	}
+	// The snapshot diverged from the local buffer (upstream rewrote earlier
+	// text). Streamed bytes cannot be recalled, so emit only the part past the
+	// common prefix and let the final result carry the corrected text.
+	common := 0
+	for common < len(streamed) && common < len(snapshot) && streamed[common] == snapshot[common] {
+		common++
+	}
+	// Never cut inside a multi-byte rune, or the delta would carry invalid UTF-8.
+	for common > 0 && !utf8.RuneStart(snapshot[common]) {
+		common--
+	}
+	log.Printf("chathub snapshot diverged streamed=%d snapshot=%d common=%d", len(streamed), len(snapshot), common)
+	return snapshot[common:]
+}
+
+// normalizeFrameToken lowercases a key or type name and drops the separators
+// ChatHub is inconsistent about, so "DocumentRevision", "document_revision" and
+// "document-revision" all compare equal.
+func normalizeFrameToken(s string) string {
+	return strings.ToLower(strings.NewReplacer("_", "", "-", "", " ", "").Replace(s))
+}
+
+// isDocumentRevisionFrame reports whether an update frame is a document-revision
+// echo. ChatHub may append such a frame after the answer; its payload repeats the
+// complete answer and must never be forwarded as a new text delta.
+//
+// Detection is deliberately limited to the revision key and the messageType /
+// contentType discriminators. Matching arbitrary string values would drop a
+// legitimate answer that merely discusses "document revision".
+func isDocumentRevisionFrame(value any) bool {
+	var walk func(any) bool
+	walk = func(value any) bool {
+		switch typed := value.(type) {
+		case map[string]any:
+			for key, child := range typed {
+				switch normalizeFrameToken(key) {
+				case "documentrevision":
+					return true
+				case "messagetype", "contenttype":
+					if s, ok := child.(string); ok && normalizeFrameToken(s) == "documentrevision" {
+						return true
+					}
+					continue
+				}
+				if walk(child) {
+					return true
+				}
+			}
+		case []any:
+			for _, child := range typed {
+				if walk(child) {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	return walk(value)
 }
 
 func buildWSURL(acc Account, sessionID, conversationID, requestID string) (string, error) {
