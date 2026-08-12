@@ -113,7 +113,31 @@ func estimateResponsesUsage(model string, input []oaiMsg, tools []chathub.Tool, 
 	if output != "" {
 		out += outputProtocolTokens
 	}
-	return responsesUsageEstimate{Values: map[string]any{"input_tokens": in, "output_tokens": out, "total_tokens": in + out}, Source: source}
+	return responsesUsageEstimate{Values: responsesUsageValues(in, out), Source: source}
+}
+
+// responsesUsageValues renders the Responses API usage object.
+//
+// input_tokens_details and output_tokens_details are part of that object, and a
+// client reads cached_tokens / cache_write_tokens / reasoning_tokens from them.
+// Omitting the details left every one of those counters silently at zero with no
+// way to tell "not cached" from "not reported". They are emitted as explicit
+// zeros instead: ChatHub reports neither prompt caching nor a reasoning-token
+// split, so zero is the honest value, and m365.usage_values_are_estimates
+// already marks the whole object as a local estimate.
+func responsesUsageValues(in, out int) map[string]any {
+	return map[string]any{
+		"input_tokens":  in,
+		"output_tokens": out,
+		"total_tokens":  in + out,
+		"input_tokens_details": map[string]any{
+			"cached_tokens":      0,
+			"cache_write_tokens": 0,
+		},
+		"output_tokens_details": map[string]any{
+			"reasoning_tokens": 0,
+		},
+	}
 }
 
 func localUsageMetadata(source string) map[string]any {
@@ -122,5 +146,8 @@ func localUsageMetadata(source string) map[string]any {
 		"usage_values_are_estimates": true,
 		"usage_estimate_scope":       "visible_request_and_completion",
 		"usage_includes":             []string{"message_content", "message_framing", "tool_schemas", "tool_choice", "tool_calls", "completion_framing"},
+		// Named explicitly so a caller reading zeros in the usage details knows
+		// they are unreported rather than measured.
+		"usage_excludes": []string{"upstream_cached_tokens", "upstream_cache_write_tokens", "upstream_reasoning_tokens"},
 	}
 }

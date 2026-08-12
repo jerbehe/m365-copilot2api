@@ -5,8 +5,6 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
-
-	"m365-copilot2api/internal/chathub"
 )
 
 // narratedToolCall is one completion that both narrates and calls a tool, plus a
@@ -140,7 +138,7 @@ func TestResponsesLiveStreamOrdersReasoningFirst(t *testing.T) {
 func TestToolResponseCarriesPreamble(t *testing.T) {
 	calls := []detectedToolCall{{ID: "call_1", Type: "function", Name: "read_file", Arguments: json.RawMessage(`{"path":"/etc/hostname"}`)}}
 	rr := httptest.NewRecorder()
-	if err := writeToolResponse(rr, "id", "m", false, calls, chathub.Result{}, "PREAMBLE"); err != nil {
+	if err := writeToolResponse(rr, toolResponse{ID: "id", Model: "m", Calls: calls, Preamble: "PREAMBLE"}); err != nil {
 		t.Fatal(err)
 	}
 	var d map[string]any
@@ -157,7 +155,7 @@ func TestToolResponseCarriesPreamble(t *testing.T) {
 	// Callers whose text is not prose pass "", which must stay null rather than
 	// becoming an empty string the client would render as a blank message.
 	rr2 := httptest.NewRecorder()
-	if err := writeToolResponse(rr2, "id", "m", false, calls, chathub.Result{}, ""); err != nil {
+	if err := writeToolResponse(rr2, toolResponse{ID: "id", Model: "m", Calls: calls}); err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(rr2.Body.String(), `"content":null`) {
@@ -168,7 +166,7 @@ func TestToolResponseCarriesPreamble(t *testing.T) {
 func TestToolResponseStreamsPreambleBeforeCall(t *testing.T) {
 	calls := []detectedToolCall{{ID: "call_1", Type: "function", Name: "read_file", Arguments: json.RawMessage(`{}`)}}
 	rr := httptest.NewRecorder()
-	if err := writeToolResponse(rr, "id", "m", true, calls, chathub.Result{}, "PREAMBLE"); err != nil {
+	if err := writeToolResponse(rr, toolResponse{ID: "id", Model: "m", Stream: true, Calls: calls, Preamble: "PREAMBLE"}); err != nil {
 		t.Fatal(err)
 	}
 	body := rr.Body.String()

@@ -1187,7 +1187,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			calls = limitToolCalls(calls, adaptiveToolCallLimit(calls, configuredToolCallLimit(s.settings)))
 			// routeRes.Text is the router's raw JSON decision, not prose, so no
 			// preamble is forwarded from it.
-			_ = writeToolResponse(w, "chatcmpl-"+uuid.NewString(), firstNonEmpty(body.Model, "m365-copilot"), true, calls, routeRes, "")
+			_ = writeToolResponse(w, toolResponse{ID: "chatcmpl-" + uuid.NewString(), Model: firstNonEmpty(body.Model, "m365-copilot"), Stream: true, Calls: calls, Result: routeRes, Prompt: prompt})
 			return
 		}
 	}
@@ -1337,7 +1337,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			calls = limitToolCalls(calls, adaptiveToolCallLimit(calls, configuredToolCallLimit(s.settings)))
 			// The preamble already went out as content deltas, including the tail
 			// released just above. Re-sending it here would duplicate it.
-			_ = writeToolResponse(w, id, model, true, calls, chathub.Result{Text: text.String()}, "")
+			_ = writeToolResponse(w, toolResponse{ID: id, Model: model, Stream: true, Calls: calls, Result: chathub.Result{Text: text.String()}, Prompt: answerPrompt})
 			if body.User != "" && res.ConversationID != "" {
 				s.userSessions.Put(body.User, res.ConversationID, res.SessionID, acc.ID)
 			}
@@ -1391,7 +1391,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			}
 			calls = limitToolCalls(calls, adaptiveToolCallLimit(calls, configuredToolCallLimit(s.settings)))
 			// Router output is a JSON decision, never prose.
-			_ = writeToolResponse(w, "chatcmpl-"+uuid.NewString(), firstNonEmpty(body.Model, "m365-copilot"), body.Stream, calls, routeRes, "")
+			_ = writeToolResponse(w, toolResponse{ID: "chatcmpl-" + uuid.NewString(), Model: firstNonEmpty(body.Model, "m365-copilot"), Stream: body.Stream, Calls: calls, Result: routeRes, Prompt: prompt})
 			return
 		}
 		if fmt.Sprint(body.ToolChoice) == "required" {
@@ -1409,7 +1409,7 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 						calls[i].ID = scopedCallID(calls[i].Name, string(calls[i].Arguments), i, scope)
 					}
 					calls = limitToolCalls(calls, adaptiveToolCallLimit(calls, configuredToolCallLimit(s.settings)))
-					_ = writeToolResponse(w, "chatcmpl-"+uuid.NewString(), firstNonEmpty(body.Model, "m365-copilot"), body.Stream, calls, retryRes, "")
+					_ = writeToolResponse(w, toolResponse{ID: "chatcmpl-" + uuid.NewString(), Model: firstNonEmpty(body.Model, "m365-copilot"), Stream: body.Stream, Calls: calls, Result: retryRes, Prompt: prompt})
 					return
 				}
 			}
@@ -1559,12 +1559,12 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 		calls = limitToolCalls(calls, adaptiveToolCallLimit(calls, configuredToolCallLimit(s.settings)))
 		// res.Text is the model's own answer here, so any prose around the call
 		// syntax is a preamble the client should still see.
-		_ = writeToolResponse(w, id, model, body.Stream, calls, res, toolPreamble(res.Text, toolMaps))
+		_ = writeToolResponse(w, toolResponse{ID: id, Model: model, Stream: body.Stream, Calls: calls, Result: res, Preamble: toolPreamble(res.Text, toolMaps), Prompt: prompt})
 		return
 	}
 	if calls := nativeToolCalls(res.Events, body.Tools); len(calls) > 0 {
 		calls = limitToolCalls(calls, adaptiveToolCallLimit(calls, configuredToolCallLimit(s.settings)))
-		_ = writeToolResponse(w, id, model, body.Stream, calls, res, toolPreamble(res.Text, toolMaps))
+		_ = writeToolResponse(w, toolResponse{ID: id, Model: model, Stream: body.Stream, Calls: calls, Result: res, Preamble: toolPreamble(res.Text, toolMaps), Prompt: prompt})
 		return
 	}
 	// Recover natural-language tool intent when native mode emits no
@@ -1588,7 +1588,7 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 				calls = limitToolCalls(calls, adaptiveToolCallLimit(calls, configuredToolCallLimit(s.settings)))
 				// The call was recovered from res.Text, the model's own prose, so
 				// that prose is the preamble. routeRes only carried the decision.
-				_ = writeToolResponse(w, id, model, body.Stream, calls, routeRes, toolPreamble(res.Text, toolMaps))
+				_ = writeToolResponse(w, toolResponse{ID: id, Model: model, Stream: body.Stream, Calls: calls, Result: routeRes, Preamble: toolPreamble(res.Text, toolMaps), Prompt: prompt})
 				return
 			}
 		}
