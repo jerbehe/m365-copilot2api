@@ -56,19 +56,26 @@ func (s *Server) streamResponsesAdapter(w http.ResponseWriter, r *http.Request, 
 //   - response.created is first and either response.completed or response.failed
 //     is last, so the client is never left waiting
 //   - every item gets one output_item.added with an id that all later events reuse
-//   - output_index is a single monotonic space shared by the message and the calls
+//   - output_index is a single monotonic space shared by the reasoning item, the
+//     message and the calls
 //   - arguments are streamed exactly once as function_call_arguments.delta, so
 //     output_item.added carries an empty arguments string
+//   - reasoning precedes the message: clients attach reasoning deltas to the most
+//     recently added item, so its item must already be open
 func translateResponsesStream(emit func(string, any) error, model string, o oaiReq, run func(innerStreamHandler) (int, string, error)) {
 	id := "resp_" + uuid.NewString()
 	created := time.Now().Unix()
 	_ = emit("response.created", map[string]any{"type": "response.created", "response": map[string]any{"id": id, "object": "response", "status": "in_progress", "model": model, "output": []any{}}})
 
 	var text strings.Builder
+	var reasoning strings.Builder
 	messageID := "msg_" + uuid.NewString()
 	contentID := "txt_" + uuid.NewString()
+	reasoningID := "rs_" + uuid.NewString()
 	textStarted := false
+	reasoningStarted := false
 	textIndex := 0
+	reasoningIndex := 0
 	type tcState struct {
 		ID, Name, Args, Type string
 		ItemID               string
@@ -85,6 +92,18 @@ func translateResponsesStream(emit func(string, any) error, model string, o oaiR
 	var upstreamErr string
 
 	status, plainErr, streamErr := run(innerStreamHandler{
+		Reasoning: func(content string) error {
+			reasoning.WriteString(content)
+			if !reasoningStarted {
+				reasoningStarted = true
+				reasoningIndex = nextOutputIndex
+				nextOutputIndex++
+				if err := emit("response.output_item.added", map[string]any{"type": "response.output_item.added", "output_index": reasoningIndex, "item": reasoningOutputItem(reasoningID, "")}); err != nil {
+					return err
+				}
+			}
+			return emit("response.reasoning_summary_text.delta", map[string]any{"type": "response.reasoning_summary_text.delta", "output_index": reasoningIndex, "item_id": reasoningID, "summary_index": 0, "delta": content})
+		},
 		Text: func(content string) error {
 			text.WriteString(content)
 			if !textStarted {
@@ -159,6 +178,14 @@ func translateResponsesStream(emit func(string, any) error, model string, o oaiR
 		return
 	}
 	output := []any{}
+	if reasoningStarted {
+		item := reasoningOutputItem(reasoningID, reasoning.String())
+		output = append(output, item)
+		// The deltas already went out. Only the terminal summary event is emitted
+		// here, for clients that read the done event instead of the deltas.
+		_ = emit("response.reasoning_summary_text.done", map[string]any{"type": "response.reasoning_summary_text.done", "output_index": reasoningIndex, "item_id": reasoningID, "summary_index": 0, "text": reasoning.String()})
+		_ = emit("response.output_item.done", map[string]any{"type": "response.output_item.done", "output_index": reasoningIndex, "item": item})
+	}
 	if textStarted {
 		item := map[string]any{"type": "message", "id": messageID, "role": "assistant", "status": "completed", "content": []any{map[string]any{"type": "output_text", "id": contentID, "text": text.String(), "annotations": []any{}}}}
 		output = append(output, item)
@@ -224,7 +251,7 @@ func (s *Server) responses(w http.ResponseWriter, r *http.Request) {
 		writeResponsesError(w, 400, "invalid_request_error", "bad json")
 		return
 	}
-	o, err := body.openAI()
+	o, isCompaction, err := body.openAIWithCompaction()
 	if err != nil {
 		writeResponsesError(w, 400, "invalid_request_error", err.Error())
 		return
@@ -240,6 +267,13 @@ func (s *Server) responses(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		o.Messages = append(messages, o.Messages...)
+	}
+	if isCompaction {
+		// A compaction turn returns one `compaction` item, so it cannot share the
+		// message/tool-call translation. It is also not addressable through
+		// previous_response_id: the client installs the summary itself.
+		s.compactionTurn(w, r, o, firstNonEmpty(body.Model, "m365-copilot"), body.Stream, startedAt)
+		return
 	}
 	if body.Stream {
 		s.streamResponsesAdapter(w, r, o, firstNonEmpty(body.Model, "m365-copilot"))
@@ -326,6 +360,41 @@ func (s *Server) responses(w http.ResponseWriter, r *http.Request) {
 		s.responseMu.Unlock()
 	}
 	writeResponsesResult(w, firstNonEmpty(body.Model, "m365-copilot"), body.Stream, out)
+}
+
+// compactionTurn answers a remote-compaction request. The summary is produced by
+// one non-streaming inner turn even when the client asked for SSE: there is a
+// single opaque item to deliver, so incremental translation buys nothing and
+// would risk emitting a partial summary as the installed context.
+func (s *Server) compactionTurn(w http.ResponseWriter, r *http.Request, o oaiReq, model string, stream bool, startedAt time.Time) {
+	out, raw, status, err := s.runOpenAIAdapter(withCompactionTurn(r), o)
+	if status >= 400 {
+		writeResponsesError(w, status, "upstream_error", errorMessage(raw, "upstream protocol error"))
+		return
+	}
+	if err != nil {
+		writeResponsesError(w, http.StatusBadGateway, "upstream_error", "upstream protocol error: "+err.Error())
+		return
+	}
+	summary, ok := compactionSummary(out)
+	if !ok {
+		writeResponsesError(w, http.StatusBadGateway, "upstream_error", "ChatHub returned no compaction summary")
+		return
+	}
+	estimate := estimateResponsesUsage(model, o.Messages, o.Tools, o.ToolChoice, summary)
+	out["usage"] = estimate.Values
+	out["m365_usage_source"] = estimate.Source
+	s.usage.record(UsageRecord{
+		Time:         time.Now(),
+		APIKeyPrefix: extractAPIKey(r),
+		Model:        model,
+		Endpoint:     "/v1/responses",
+		InputTokens:  int64(estimate.Values["input_tokens"].(int)),
+		OutputTokens: int64(estimate.Values["output_tokens"].(int)),
+		DurationMs:   time.Since(startedAt).Milliseconds(),
+		Status:       200,
+	})
+	writeCompactionResult(w, model, stream, out)
 }
 
 func responsesOutputHasContent(src map[string]any) bool {

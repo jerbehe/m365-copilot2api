@@ -6,9 +6,19 @@ import (
 	"time"
 )
 
-func writeToolResponse(w http.ResponseWriter, id, model string, stream bool, calls []detectedToolCall, res chathub.Result) error {
+// writeToolResponse serializes a tool-call turn.
+//
+// preamble is the assistant text that accompanied the calls. It is a separate
+// parameter rather than being read from res.Text because most callers hold text
+// that must never reach the client: the tool router's raw JSON decision, or an
+// answer whose deltas were already streamed. Only callers that know their text is
+// prose pass it, and they strip tool syntax first.
+func writeToolResponse(w http.ResponseWriter, id, model string, stream bool, calls []detectedToolCall, res chathub.Result, preamble string) error {
 	toolCalls := toolCallMaps(calls)
 	msg := map[string]any{"role": "assistant", "content": nil, "tool_calls": toolCalls}
+	if preamble != "" {
+		msg["content"] = preamble
+	}
 	if res.Reasoning != "" {
 		msg["reasoning_content"] = res.Reasoning
 	}
@@ -26,6 +36,9 @@ func writeToolResponse(w http.ResponseWriter, id, model string, stream bool, cal
 			return map[string]any{"id": id, "object": "chat.completion.chunk", "created": time.Now().Unix(), "model": model, "choices": []any{map[string]any{"index": 0, "delta": delta, "finish_reason": finish}}}
 		}
 		firstDelta := map[string]any{"role": "assistant", "content": nil}
+		if preamble != "" {
+			firstDelta["content"] = preamble
+		}
 		if res.Reasoning != "" {
 			firstDelta["reasoning_content"] = res.Reasoning
 		}

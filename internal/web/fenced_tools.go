@@ -189,3 +189,12 @@ func withholdToolFences(text string, tools []map[string]any) (string, bool) {
 	}
 	return stripped, true
 }
+
+// toolPreamble returns the prose that accompanied a tool call, with the call's
+// own syntax removed. A turn that both narrates and calls a tool must deliver
+// both: dropping the narration loses the model's stated intent, and clients show
+// nothing but a bare call.
+func toolPreamble(text string, tools []map[string]any) string {
+	stripped, _ := stripToolFences(text, tools)
+	return strings.TrimSpace(stripped)
+}

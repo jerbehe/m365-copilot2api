@@ -1185,7 +1185,9 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 				calls[i].ID = scopedCallID(calls[i].Name, string(calls[i].Arguments), i, scope)
 			}
 			calls = limitToolCalls(calls, adaptiveToolCallLimit(calls, configuredToolCallLimit(s.settings)))
-			_ = writeToolResponse(w, "chatcmpl-"+uuid.NewString(), firstNonEmpty(body.Model, "m365-copilot"), true, calls, routeRes)
+			// routeRes.Text is the router's raw JSON decision, not prose, so no
+			// preamble is forwarded from it.
+			_ = writeToolResponse(w, "chatcmpl-"+uuid.NewString(), firstNonEmpty(body.Model, "m365-copilot"), true, calls, routeRes, "")
 			return
 		}
 	}
@@ -1210,14 +1212,16 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		var pending strings.Builder
 		var streamedTools []detectedToolCall
 		first := true
-		emitText := func(part string) error {
-			if part == "" {
-				return nil
-			}
+		// textEmitted tracks answer text specifically. `first` alone no longer
+		// answers "was any prose delivered", because a reasoning delta also claims
+		// it, and reasoning is not an answer.
+		textEmitted := false
+		// writeDelta emits one chunk, stamping the assistant role onto whichever
+		// delta happens to be first: a reasoning delta may precede any text.
+		writeDelta := func(delta map[string]any) error {
 			if err := r.Context().Err(); err != nil {
 				return err
 			}
-			delta := map[string]any{"content": part}
 			if first {
 				delta["role"] = "assistant"
 				first = false
@@ -1231,10 +1235,30 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			flusher.Flush()
 			return nil
 		}
+		emitText := func(part string) error {
+			if part == "" {
+				return nil
+			}
+			textEmitted = true
+			return writeDelta(map[string]any{"content": part})
+		}
+		emitReasoning := func(part string) error {
+			if part == "" {
+				return nil
+			}
+			return writeDelta(map[string]any{"reasoning_content": part})
+		}
 		res, err := s.chat.ChatWithEvents(ctx, account, answerReq, func(ev chathub.StreamEvent) error {
 			if ev.Kind == "tool" && ev.ToolName != "" && len(ev.Arguments) > 0 {
 				streamedTools = append(streamedTools, detectedToolCall{ID: "call_" + uuid.NewString(), Name: ev.ToolName, Arguments: ev.Arguments})
 				return nil
+			}
+			// Forward the chain-of-thought transcript as reasoning_content deltas.
+			// Protocol adapters translate this into their own reasoning shape; the
+			// other streaming branch already did so via ChatWithReasoning, and
+			// dropping it here made reasoning depend on which branch ran.
+			if ev.Kind == "reasoning" && ev.Text != "" {
+				return emitReasoning(ev.Text)
 			}
 			if ev.Kind != "text" || ev.Text == "" {
 				return nil
@@ -1311,7 +1335,9 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			calls = limitToolCalls(calls, adaptiveToolCallLimit(calls, configuredToolCallLimit(s.settings)))
-			_ = writeToolResponse(w, id, model, true, calls, chathub.Result{Text: text.String()})
+			// The preamble already went out as content deltas, including the tail
+			// released just above. Re-sending it here would duplicate it.
+			_ = writeToolResponse(w, id, model, true, calls, chathub.Result{Text: text.String()}, "")
 			if body.User != "" && res.ConversationID != "" {
 				s.userSessions.Put(body.User, res.ConversationID, res.SessionID, acc.ID)
 			}
@@ -1319,10 +1345,10 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		// No parser claimed a call, so a withheld fence was unusable tool syntax
-		// rather than prose. `first` is still set when every delta so far was held
-		// back, meaning the whole answer was tool syntax. An empty stream looks like
-		// a hang, so say why no call was produced.
-		if withheld && first && strings.TrimSpace(tail) == "" {
+		// rather than prose. No text having been emitted means the whole answer was
+		// tool syntax. An empty stream looks like a hang, so say why no call was
+		// produced.
+		if withheld && !textEmitted && strings.TrimSpace(tail) == "" {
 			tail = withheldToolFenceNotice
 		}
 		if err := emitText(tail); err != nil {
@@ -1364,7 +1390,8 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 				calls[i].ID = scopedCallID(calls[i].Name, string(calls[i].Arguments), i, scope)
 			}
 			calls = limitToolCalls(calls, adaptiveToolCallLimit(calls, configuredToolCallLimit(s.settings)))
-			_ = writeToolResponse(w, "chatcmpl-"+uuid.NewString(), firstNonEmpty(body.Model, "m365-copilot"), body.Stream, calls, routeRes)
+			// Router output is a JSON decision, never prose.
+			_ = writeToolResponse(w, "chatcmpl-"+uuid.NewString(), firstNonEmpty(body.Model, "m365-copilot"), body.Stream, calls, routeRes, "")
 			return
 		}
 		if fmt.Sprint(body.ToolChoice) == "required" {
@@ -1382,7 +1409,7 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 						calls[i].ID = scopedCallID(calls[i].Name, string(calls[i].Arguments), i, scope)
 					}
 					calls = limitToolCalls(calls, adaptiveToolCallLimit(calls, configuredToolCallLimit(s.settings)))
-					_ = writeToolResponse(w, "chatcmpl-"+uuid.NewString(), firstNonEmpty(body.Model, "m365-copilot"), body.Stream, calls, retryRes)
+					_ = writeToolResponse(w, "chatcmpl-"+uuid.NewString(), firstNonEmpty(body.Model, "m365-copilot"), body.Stream, calls, retryRes, "")
 					return
 				}
 			}
@@ -1530,12 +1557,14 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 	id := "chatcmpl-" + uuid.NewString()
 	if calls := fencedToolCalls(res.Text, toolMaps, body.ToolChoice); len(calls) > 0 {
 		calls = limitToolCalls(calls, adaptiveToolCallLimit(calls, configuredToolCallLimit(s.settings)))
-		_ = writeToolResponse(w, id, model, body.Stream, calls, res)
+		// res.Text is the model's own answer here, so any prose around the call
+		// syntax is a preamble the client should still see.
+		_ = writeToolResponse(w, id, model, body.Stream, calls, res, toolPreamble(res.Text, toolMaps))
 		return
 	}
 	if calls := nativeToolCalls(res.Events, body.Tools); len(calls) > 0 {
 		calls = limitToolCalls(calls, adaptiveToolCallLimit(calls, configuredToolCallLimit(s.settings)))
-		_ = writeToolResponse(w, id, model, body.Stream, calls, res)
+		_ = writeToolResponse(w, id, model, body.Stream, calls, res, toolPreamble(res.Text, toolMaps))
 		return
 	}
 	// Recover natural-language tool intent when native mode emits no
@@ -1557,12 +1586,14 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 					calls[i].ID = scopedCallID(calls[i].Name, string(calls[i].Arguments), i, scope)
 				}
 				calls = limitToolCalls(calls, adaptiveToolCallLimit(calls, configuredToolCallLimit(s.settings)))
-				_ = writeToolResponse(w, id, model, body.Stream, calls, routeRes)
+				// The call was recovered from res.Text, the model's own prose, so
+				// that prose is the preamble. routeRes only carried the decision.
+				_ = writeToolResponse(w, id, model, body.Stream, calls, routeRes, toolPreamble(res.Text, toolMaps))
 				return
 			}
 		}
 	}
-	if !completionEvidenceAllows(res.Text, ledger) {
+	if !isCompactionTurn(r) && !completionEvidenceAllows(res.Text, ledger) {
 		res.Text = "I cannot confirm completion because no matching tool results were returned. No external action has been verified."
 	}
 	// No parser claimed a call by this point. Any remaining fenced block naming a

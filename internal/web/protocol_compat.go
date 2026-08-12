@@ -27,6 +27,14 @@ type responsesRequest struct {
 const customExecWorkspaceInstruction = `You are operating through the caller's local OpenCode execution bridge. Never use, request, or mention Microsoft 365/Copilot native tools. The only permitted execution tool is the caller-provided custom exec tool. The executor already starts in the caller-selected project workspace. Use relative paths only; never guess, cd to, or write under /root, /workspace, /tmp, or any other absolute project path. Inspect pwd and ls before changes. Do not create files outside the current working directory. Never claim a file was created, modified, or verified until custom exec returns a successful result. After every execution, use custom exec to verify the result.`
 
 func (r responsesRequest) openAI() (oaiReq, error) {
+	o, _, err := r.openAIWithCompaction()
+	return o, err
+}
+
+// openAIWithCompaction converts the request and reports whether it is a remote
+// compaction turn. Such a turn is answered with a `compaction` output item
+// rather than an assistant message, so the caller has to know before dispatch.
+func (r responsesRequest) openAIWithCompaction() (oaiReq, bool, error) {
 	o := oaiReq{Model: r.Model, AccountID: r.AccountID, Stream: r.Stream, ToolChoice: r.ToolChoice, User: r.User}
 	if instructions := strings.TrimSpace(r.Instructions); instructions != "" {
 		o.Messages = append(o.Messages, oaiMsg{Role: "system", Content: instructions})
@@ -36,10 +44,11 @@ func (r responsesRequest) openAI() (oaiReq, error) {
 		o.ReasoningEffort = r.Reasoning.Effort
 	}
 	var inputTools []map[string]any
+	isCompaction := false
 	switch v := r.Input.(type) {
 	case string:
 		if v == "" {
-			return o, fmt.Errorf("input required")
+			return o, false, fmt.Errorf("input required")
 		}
 		o.Messages = append(o.Messages, oaiMsg{Role: "user", Content: v})
 	case []any:
@@ -56,12 +65,26 @@ func (r responsesRequest) openAI() (oaiReq, error) {
 				// ChatHub with zero tools and the model answers from imagination.
 				inputTools = append(inputTools, flattenAdditionalTools(m)...)
 				continue
+			case compactionTriggerItemType:
+				// A request control, not history: it asks for this turn to produce a
+				// compaction summary and carries no content of its own.
+				isCompaction = true
+				continue
+			case "compaction", "context_compaction":
+				// A summary this gateway produced on an earlier compaction turn.
+				// Replay it as context so the conversation survives the reset;
+				// leaving it to the default branch would ship the raw item JSON.
+				summary := stringValue(m, "encrypted_content")
+				if summary == "" {
+					continue
+				}
+				o.Messages = append(o.Messages, oaiMsg{Role: "user", Content: compactionSummaryPrefix + summary})
 			case "function_call_progress":
 				// Progress is deliberately not converted into an assistant/tool
 				// message. It is transport metadata from a long-running client-side
 				// executor and must not trigger a model turn or tool completion.
 				if _, ok := parseToolProgress(m); !ok {
-					return o, fmt.Errorf("invalid function_call_progress")
+					return o, false, fmt.Errorf("invalid function_call_progress")
 				}
 				continue
 			case "function_call_output":
@@ -102,7 +125,15 @@ func (r responsesRequest) openAI() (oaiReq, error) {
 			}
 		}
 	default:
-		return o, fmt.Errorf("input must be string or array")
+		return o, false, fmt.Errorf("input must be string or array")
+	}
+	if isCompaction {
+		// The summary must be produced by the model itself, so the tool catalog is
+		// dropped: a compaction response may not contain a tool call, and offering
+		// tools invites one. The instruction goes last so it is the live request.
+		o.Messages = append(o.Messages, oaiMsg{Role: "user", Content: compactionInstruction})
+		o.ToolChoice = nil
+		return o, true, nil
 	}
 	tools := append(append([]map[string]any(nil), r.Tools...), inputTools...)
 	hasCustomExec := false
@@ -136,7 +167,7 @@ func (r responsesRequest) openAI() (oaiReq, error) {
 	if hasCustomExec {
 		o.Messages = append([]oaiMsg{{Role: "system", Content: customExecWorkspaceInstruction}}, o.Messages...)
 	}
-	return o, nil
+	return o, false, nil
 }
 
 // flattenAdditionalTools unwraps a Codex `additional_tools` input item. Its

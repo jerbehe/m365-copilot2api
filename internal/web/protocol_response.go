@@ -42,7 +42,11 @@ func writeAnthropicResultUsage(w http.ResponseWriter, model string, stream bool,
 	if reasoning, _ := msg["reasoning_content"].(string); reasoning != "" {
 		blocks = append(blocks, map[string]any{"type": "thinking", "thinking": reasoning, "signature": ""})
 	}
-	if calls, ok := msg["tool_calls"].([]any); ok {
+	// Text comes before the calls, and both are emitted: a turn that narrates and
+	// then calls a tool must deliver the narration too, or the client shows a bare
+	// call and the model's stated intent is lost.
+	blocks = append(blocks, anthropicContentBlocks(msg["content"])...)
+	if calls, ok := msg["tool_calls"].([]any); ok && len(calls) > 0 {
 		stop = "tool_use"
 		for _, raw := range calls {
 			tc, _ := raw.(map[string]any)
@@ -53,29 +57,8 @@ func writeAnthropicResultUsage(w http.ResponseWriter, model string, stream bool,
 			}
 			blocks = append(blocks, map[string]any{"type": "tool_use", "id": tc["id"], "name": fn["name"], "input": input})
 		}
-	} else {
-		switch content := msg["content"].(type) {
-		case []any:
-			for _, raw := range content {
-				part, _ := raw.(map[string]any)
-				switch part["type"] {
-				case "text":
-					if t, _ := part["text"].(string); t != "" {
-						blocks = append(blocks, map[string]any{"type": "text", "text": t})
-					}
-				case "image_url":
-					img, _ := part["image_url"].(map[string]any)
-					if u, _ := img["url"].(string); u != "" {
-						blocks = append(blocks, map[string]any{"type": "image", "source": map[string]any{"type": "url", "url": u}})
-					}
-				}
-			}
-		default:
-			blocks = append(blocks, map[string]any{"type": "text", "text": fmt.Sprint(content)})
-		}
-		if len(blocks) == 0 {
-			blocks = append(blocks, map[string]any{"type": "text", "text": ""})
-		}
+	} else if len(blocks) == 0 {
+		blocks = append(blocks, map[string]any{"type": "text", "text": ""})
 	}
 	_ = finish
 	out := map[string]any{"id": id, "type": "message", "role": "assistant", "model": model, "content": blocks, "stop_reason": stop, "stop_sequence": nil, "usage": map[string]any{"input_tokens": inputTokens, "output_tokens": outputTokens}, "m365": localUsageMetadata(usageSource)}
@@ -128,6 +111,41 @@ func writeAnthropicResultUsage(w http.ResponseWriter, model string, stream bool,
 	}
 	emit("message_delta", map[string]any{"type": "message_delta", "delta": map[string]any{"stop_reason": stop, "stop_sequence": nil}, "usage": map[string]any{"output_tokens": outputTokens}})
 	emit("message_stop", map[string]any{"type": "message_stop"})
+}
+
+// anthropicContentBlocks converts an internal message content field into
+// Anthropic content blocks. Empty text yields no block, so a pure tool-call turn
+// does not gain a stray empty text block.
+func anthropicContentBlocks(content any) []any {
+	var blocks []any
+	switch content := content.(type) {
+	case nil:
+		return nil
+	case string:
+		if content != "" {
+			blocks = append(blocks, map[string]any{"type": "text", "text": content})
+		}
+	case []any:
+		for _, raw := range content {
+			part, _ := raw.(map[string]any)
+			switch part["type"] {
+			case "text":
+				if t, _ := part["text"].(string); t != "" {
+					blocks = append(blocks, map[string]any{"type": "text", "text": t})
+				}
+			case "image_url":
+				img, _ := part["image_url"].(map[string]any)
+				if u, _ := img["url"].(string); u != "" {
+					blocks = append(blocks, map[string]any{"type": "image", "source": map[string]any{"type": "url", "url": u}})
+				}
+			}
+		}
+	default:
+		if text := fmt.Sprint(content); text != "" {
+			blocks = append(blocks, map[string]any{"type": "text", "text": text})
+		}
+	}
+	return blocks
 }
 
 // sseWriteFrame writes one SSE frame and flushes; a write error (client gone,
