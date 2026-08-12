@@ -20,9 +20,23 @@ func openAIChoice(v map[string]any) (map[string]any, string) {
 	return m, finish
 }
 
+// writeAnthropicResult renders a non-streaming Anthropic message, or replays a
+// completed result as an SSE stream for callers that already hold the full text.
+// Live streaming uses streamAnthropicMessages instead.
 func writeAnthropicResult(w http.ResponseWriter, model string, stream bool, src map[string]any) {
+	writeAnthropicResultUsage(w, model, stream, src, responsesUsageEstimate{})
+}
+
+func writeAnthropicResultUsage(w http.ResponseWriter, model string, stream bool, src map[string]any, estimate responsesUsageEstimate) {
 	id := "msg_" + uuid.NewString()
 	msg, finish := openAIChoice(src)
+	inputTokens, outputTokens := 0, 0
+	usageSource := "unavailable_from_chathub"
+	if estimate.Values != nil {
+		inputTokens, _ = estimate.Values["input_tokens"].(int)
+		outputTokens, _ = estimate.Values["output_tokens"].(int)
+		usageSource = estimate.Source
+	}
 	blocks := []any{}
 	stop := "end_turn"
 	if reasoning, _ := msg["reasoning_content"].(string); reasoning != "" {
@@ -64,12 +78,14 @@ func writeAnthropicResult(w http.ResponseWriter, model string, stream bool, src 
 		}
 	}
 	_ = finish
-	out := map[string]any{"id": id, "type": "message", "role": "assistant", "model": model, "content": blocks, "stop_reason": stop, "stop_sequence": nil, "usage": map[string]any{"input_tokens": 0, "output_tokens": 0}, "m365": map[string]any{"usage_source": "unavailable_from_chathub", "usage_values_are_placeholders": true}}
+	out := map[string]any{"id": id, "type": "message", "role": "assistant", "model": model, "content": blocks, "stop_reason": stop, "stop_sequence": nil, "usage": map[string]any{"input_tokens": inputTokens, "output_tokens": outputTokens}, "m365": localUsageMetadata(usageSource)}
 	if !stream {
 		jsonOut(w, out)
 		return
 	}
 	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("X-Accel-Buffering", "no")
 	f, _ := w.(http.Flusher)
 	aborted := false
 	emit := func(n string, v any) {
@@ -80,14 +96,14 @@ func writeAnthropicResult(w http.ResponseWriter, model string, stream bool, src 
 			aborted = true
 		}
 	}
-	emit("message_start", map[string]any{"type": "message_start", "message": map[string]any{"id": id, "type": "message", "role": "assistant", "model": model, "content": []any{}, "stop_reason": nil, "usage": map[string]any{"input_tokens": 0, "output_tokens": 0}}})
+	emit("message_start", map[string]any{"type": "message_start", "message": map[string]any{"id": id, "type": "message", "role": "assistant", "model": model, "content": []any{}, "stop_reason": nil, "stop_sequence": nil, "usage": map[string]any{"input_tokens": inputTokens, "output_tokens": 0}}})
+	emit("ping", map[string]any{"type": "ping"})
 	for i, b := range blocks {
 		m, _ := b.(map[string]any)
-		startBlock := b
-		blockType := ""
-		if t, _ := m["type"].(string); t != "" {
-			blockType = t
-		}
+		blockType, _ := m["type"].(string)
+		// content_block_start must never carry the block's payload: clients append
+		// the deltas to it, so a pre-filled start duplicates the whole block.
+		var startBlock any
 		switch blockType {
 		case "tool_use":
 			startBlock = map[string]any{"type": "tool_use", "id": m["id"], "name": m["name"], "input": map[string]any{}}
@@ -95,6 +111,8 @@ func writeAnthropicResult(w http.ResponseWriter, model string, stream bool, src 
 			startBlock = map[string]any{"type": "thinking", "thinking": "", "signature": ""}
 		case "image":
 			startBlock = map[string]any{"type": "image", "source": m["source"]}
+		default:
+			startBlock = map[string]any{"type": "text", "text": ""}
 		}
 		emit("content_block_start", map[string]any{"type": "content_block_start", "index": i, "content_block": startBlock})
 		switch blockType {
@@ -108,7 +126,7 @@ func writeAnthropicResult(w http.ResponseWriter, model string, stream bool, src 
 		}
 		emit("content_block_stop", map[string]any{"type": "content_block_stop", "index": i})
 	}
-	emit("message_delta", map[string]any{"type": "message_delta", "delta": map[string]any{"stop_reason": stop, "stop_sequence": nil}, "usage": map[string]any{"output_tokens": 0}})
+	emit("message_delta", map[string]any{"type": "message_delta", "delta": map[string]any{"stop_reason": stop, "stop_sequence": nil}, "usage": map[string]any{"output_tokens": outputTokens}})
 	emit("message_stop", map[string]any{"type": "message_stop"})
 }
 

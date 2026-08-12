@@ -12,7 +12,6 @@ import (
 	"net/url"
 	"strings"
 	"time"
-	"unicode/utf8"
 
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
@@ -206,24 +205,29 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 		return Result{}, fmt.Errorf("chat send: %w", err)
 	}
 
-	var deltas []string
-	var streamed strings.Builder
-	emitDelta := func(d string) error {
+	var answer answerBuffer
+	firstForward := true
+	forward := func(d string) error {
 		if d == "" {
 			return nil
 		}
-		if streamed.Len() == 0 {
+		if firstForward {
+			firstForward = false
 			log.Printf("chathub timing first_delta_ms=%d len=%d", time.Since(payloadSentAt).Milliseconds(), len(d))
 		}
-		streamed.WriteString(d)
-		deltas = append(deltas, d)
 		if onDelta != nil {
 			return onDelta(d)
 		}
 		return nil
 	}
+	cursorFrames, snapshotFrames := 0, 0
+	emitDelta := func(chunk string) error {
+		cursorFrames++
+		return forward(answer.Append(chunk))
+	}
 	emitSnapshot := func(snapshot string) error {
-		return emitDelta(snapshotDelta(streamed.String(), snapshot))
+		snapshotFrames++
+		return forward(answer.Replace(snapshot))
 	}
 	var final string
 	var throttling any
@@ -370,11 +374,16 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 				if errObj, ok := obj["error"].(map[string]any); ok {
 					return Result{}, fmt.Errorf("chathub completion error: %v", errObj)
 				}
+				// Release whatever is still buffered: the answer is final, so no
+				// further rewrite can arrive.
+				if err := forward(answer.Flush()); err != nil {
+					return Result{}, err
+				}
 				// end of stream
-				log.Printf("chathub timing completion_frame_ms=%d streamed_text=%d events=%d", time.Since(payloadSentAt).Milliseconds(), streamed.Len(), len(events))
+				log.Printf("chathub timing completion_frame_ms=%d streamed_text=%d emitted=%d cursor_frames=%d snapshot_frames=%d events=%d", time.Since(payloadSentAt).Milliseconds(), len(answer.Text()), answer.Emitted(), cursorFrames, snapshotFrames, len(events))
 				text := final
 				if text == "" {
-					text = strings.Join(deltas, "")
+					text = answer.Text()
 				}
 				return Result{
 					Text:           text,
@@ -396,51 +405,6 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 	// an incomplete upstream response. Do not return accumulated deltas as if
 	// they were a successful, finished answer.
 	return Result{}, fmt.Errorf("chathub response deadline exceeded before completion")
-}
-
-// snapshotDelta returns the part of an authoritative ChatHub snapshot that has
-// not been streamed yet.
-//
-// ChatHub carries answer text in two distinct frame shapes that must never share
-// one heuristic:
-//
-//	writeAtCursor — a pure incremental chunk appended at the cursor. It is
-//	  always new text, even when it repeats what was just emitted ("常" arriving
-//	  right after text already ending in "常"), so it is forwarded verbatim.
-//	  Overlap matching used to swallow such chunks, desynchronising the local
-//	  buffer until the next snapshot looked unrelated and the whole answer was
-//	  re-emitted (AAA…).
-//
-//	bot message text — a full snapshot of the answer so far, handled here.
-//	  Upstream keeps these monotonic, so only the suffix beyond what was already
-//	  streamed may be emitted.
-func snapshotDelta(streamed, snapshot string) string {
-	if snapshot == "" {
-		return ""
-	}
-	if streamed == "" {
-		return snapshot
-	}
-	if strings.HasPrefix(snapshot, streamed) {
-		return snapshot[len(streamed):]
-	}
-	if strings.HasPrefix(streamed, snapshot) {
-		// Stale or partial snapshot; everything in it was already streamed.
-		return ""
-	}
-	// The snapshot diverged from the local buffer (upstream rewrote earlier
-	// text). Streamed bytes cannot be recalled, so emit only the part past the
-	// common prefix and let the final result carry the corrected text.
-	common := 0
-	for common < len(streamed) && common < len(snapshot) && streamed[common] == snapshot[common] {
-		common++
-	}
-	// Never cut inside a multi-byte rune, or the delta would carry invalid UTF-8.
-	for common > 0 && !utf8.RuneStart(snapshot[common]) {
-		common--
-	}
-	log.Printf("chathub snapshot diverged streamed=%d snapshot=%d common=%d", len(streamed), len(snapshot), common)
-	return snapshot[common:]
 }
 
 // normalizeFrameToken lowercases a key or type name and drops the separators

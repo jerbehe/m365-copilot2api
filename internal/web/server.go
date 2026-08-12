@@ -165,6 +165,7 @@ func (s *Server) Routes() http.Handler {
 	m.HandleFunc("/v1/chat/completions", s.openaiChat)
 	m.HandleFunc("/v1/responses", s.responses)
 	m.HandleFunc("/v1/messages", s.anthropicMessages)
+	m.HandleFunc("/v1/messages/count_tokens", s.countAnthropicTokens)
 	m.HandleFunc("/v1/images/generations", s.imageGenerations)
 	m.HandleFunc("/", s.rootPage)
 	return recoverPanics(requestID(httpTrace(securityHeaders(s.adminMiddleware(s.debugMiddleware(m))))))
@@ -1295,7 +1296,20 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		if len(calls) == 0 {
 			calls = fencedToolCalls(text.String(), toolMaps, body.ToolChoice)
 		}
+		// The tail of the answer is still buffered: emitText always holds back the
+		// last few runes so a tool fence can be recognised before it is forwarded as
+		// prose. Release it now, with any tool syntax stripped. Returning without
+		// this silently truncated every preamble that preceded a tool call — Claude
+		// Code showed "现在创" where the model had written "现在创建文件".
+		tail, withheld := stripToolFences(pending.String(), toolMaps)
+		if withheld {
+			log.Printf("[req-trace] id=%s stage=stream_fence_withheld pending=%d emitted=%d", requestID, pending.Len(), len(tail))
+		}
 		if len(calls) > 0 {
+			if err := emitText(tail); err != nil {
+				log.Printf("[req-trace] id=%s stage=stream_write err=%v", requestID, err)
+				return
+			}
 			calls = limitToolCalls(calls, adaptiveToolCallLimit(calls, configuredToolCallLimit(s.settings)))
 			_ = writeToolResponse(w, id, model, true, calls, chathub.Result{Text: text.String()})
 			if body.User != "" && res.ConversationID != "" {
@@ -1304,19 +1318,12 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			s.bindConversation(acc, &body, r, res, answerPrompt, startedAt)
 			return
 		}
-		// Whatever is still buffered may hold a fenced tool call that no parser
-		// claimed (truncated body, garbled JSON). Forwarding it as prose ends the
-		// turn with a wall of raw tool syntax and no call, so strip those blocks
-		// and emit only the surrounding text.
-		tail, withheld := stripToolFences(pending.String(), toolMaps)
-		if withheld {
-			log.Printf("[req-trace] id=%s stage=stream_fence_withheld pending=%d emitted=%d", requestID, pending.Len(), len(tail))
-			// `first` is still set when every delta so far was held back, meaning
-			// the whole answer was tool syntax. An empty stream looks like a hang,
-			// so say why no call was produced.
-			if first && strings.TrimSpace(tail) == "" {
-				tail = withheldToolFenceNotice
-			}
+		// No parser claimed a call, so a withheld fence was unusable tool syntax
+		// rather than prose. `first` is still set when every delta so far was held
+		// back, meaning the whole answer was tool syntax. An empty stream looks like
+		// a hang, so say why no call was produced.
+		if withheld && first && strings.TrimSpace(tail) == "" {
+			tail = withheldToolFenceNotice
 		}
 		if err := emitText(tail); err != nil {
 			log.Printf("[req-trace] id=%s stage=stream_write err=%v", requestID, err)
