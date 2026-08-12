@@ -941,6 +941,9 @@ type oaiReq struct {
 	ResponseFormat *responseFormat `json:"response_format,omitempty"`
 	Messages       []oaiMsg        `json:"messages"`
 	Stream         bool            `json:"stream"`
+	// StreamOptions carries include_usage, which asks for a final usage-only
+	// chunk after the terminal finish_reason chunk.
+	StreamOptions *streamOptions `json:"stream_options,omitempty"`
 	// optional account routing
 	User           string `json:"user"`
 	AccountID      string `json:"accountId"`
@@ -965,10 +968,13 @@ func mustJSON(v any) string { b, _ := json.Marshal(v); return string(b) }
 
 // writeStreamFinish emits a terminal OpenAI-compatible chunk with a non-null
 // finish_reason before the stream ends, so strict clients do not treat an
-// otherwise successful response as incomplete.
-func writeStreamFinish(ctx context.Context, w http.ResponseWriter, flusher http.Flusher, id, model string) {
-	finishChunk := map[string]any{"id": id, "object": "chat.completion.chunk", "created": time.Now().Unix(), "model": model, "choices": []map[string]any{{"index": 0, "delta": map[string]any{}, "finish_reason": "stop"}}}
+// otherwise successful response as incomplete. When the client opted into
+// include_usage, the usage-only chunk follows it, before [DONE].
+func writeStreamFinish(ctx context.Context, w http.ResponseWriter, flusher http.Flusher, id, model string, usage streamUsage) {
+	created := time.Now().Unix()
+	finishChunk := usage.decorate(map[string]any{"id": id, "object": "chat.completion.chunk", "created": created, "model": model, "choices": []map[string]any{{"index": 0, "delta": map[string]any{}, "finish_reason": "stop"}}})
 	_ = sseRaw(ctx, w, flusher, "data: "+mustJSON(finishChunk)+"\n\n")
+	usage.writeFinal(ctx, w, flusher, id, model, created)
 }
 
 func contentToString(c any) string {
@@ -1187,7 +1193,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			calls = limitToolCalls(calls, adaptiveToolCallLimit(calls, configuredToolCallLimit(s.settings)))
 			// routeRes.Text is the router's raw JSON decision, not prose, so no
 			// preamble is forwarded from it.
-			_ = writeToolResponse(w, toolResponse{ID: "chatcmpl-" + uuid.NewString(), Model: firstNonEmpty(body.Model, "m365-copilot"), Stream: true, Calls: calls, Result: routeRes, Prompt: prompt})
+			_ = writeToolResponse(w, toolResponse{ID: "chatcmpl-" + uuid.NewString(), Model: firstNonEmpty(body.Model, "m365-copilot"), Stream: true, Calls: calls, Result: routeRes, Prompt: prompt, Options: body.StreamOptions})
 			return
 		}
 	}
@@ -1197,6 +1203,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		answerReq := chathub.Request{Text: answerPrompt, Tone: tone, ConversationID: body.ConversationID, SessionID: body.SessionID, Attachments: body.Attachments, Tools: body.Tools, ToolChoice: body.ToolChoice}
 		id := "chatcmpl-" + uuid.NewString()
 		model := firstNonEmpty(body.Model, "m365-copilot")
+		usage := newStreamUsage(body.StreamOptions, answerPrompt)
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("Connection", "keep-alive")
@@ -1226,7 +1233,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 				delta["role"] = "assistant"
 				first = false
 			}
-			chunk := map[string]any{"id": id, "object": "chat.completion.chunk", "created": time.Now().Unix(), "model": model, "choices": []any{map[string]any{"index": 0, "delta": delta, "finish_reason": nil}}}
+			chunk := usage.decorate(map[string]any{"id": id, "object": "chat.completion.chunk", "created": time.Now().Unix(), "model": model, "choices": []any{map[string]any{"index": 0, "delta": delta, "finish_reason": nil}}})
 			rc := http.NewResponseController(w)
 			_ = rc.SetWriteDeadline(time.Now().Add(30 * time.Second))
 			if _, err := fmt.Fprintf(w, "data: %s\n\n", mustJSON(chunk)); err != nil {
@@ -1240,12 +1247,15 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 				return nil
 			}
 			textEmitted = true
+			usage.addCompletion(part)
 			return writeDelta(map[string]any{"content": part})
 		}
 		emitReasoning := func(part string) error {
 			if part == "" {
 				return nil
 			}
+			// Reasoning counts toward completion tokens: the client received it.
+			usage.addCompletion(part)
 			return writeDelta(map[string]any{"reasoning_content": part})
 		}
 		res, err := s.chat.ChatWithEvents(ctx, account, answerReq, func(ev chathub.StreamEvent) error {
@@ -1337,7 +1347,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			calls = limitToolCalls(calls, adaptiveToolCallLimit(calls, configuredToolCallLimit(s.settings)))
 			// The preamble already went out as content deltas, including the tail
 			// released just above. Re-sending it here would duplicate it.
-			_ = writeToolResponse(w, toolResponse{ID: id, Model: model, Stream: true, Calls: calls, Result: chathub.Result{Text: text.String()}, Prompt: answerPrompt})
+			_ = writeToolResponse(w, toolResponse{ID: id, Model: model, Stream: true, Calls: calls, Result: chathub.Result{Text: text.String()}, Prompt: answerPrompt, Options: body.StreamOptions})
 			if body.User != "" && res.ConversationID != "" {
 				s.userSessions.Put(body.User, res.ConversationID, res.SessionID, acc.ID)
 			}
@@ -1355,7 +1365,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			log.Printf("[req-trace] id=%s stage=stream_write err=%v", requestID, err)
 			return
 		}
-		writeStreamFinish(r.Context(), w, flusher, id, model)
+		writeStreamFinish(r.Context(), w, flusher, id, model, usage)
 		_ = sseRaw(r.Context(), w, flusher, "data: [DONE]\n\n")
 		if body.User != "" && res.ConversationID != "" {
 			s.userSessions.Put(body.User, res.ConversationID, res.SessionID, acc.ID)
@@ -1391,7 +1401,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			}
 			calls = limitToolCalls(calls, adaptiveToolCallLimit(calls, configuredToolCallLimit(s.settings)))
 			// Router output is a JSON decision, never prose.
-			_ = writeToolResponse(w, toolResponse{ID: "chatcmpl-" + uuid.NewString(), Model: firstNonEmpty(body.Model, "m365-copilot"), Stream: body.Stream, Calls: calls, Result: routeRes, Prompt: prompt})
+			_ = writeToolResponse(w, toolResponse{ID: "chatcmpl-" + uuid.NewString(), Model: firstNonEmpty(body.Model, "m365-copilot"), Stream: body.Stream, Calls: calls, Result: routeRes, Prompt: prompt, Options: body.StreamOptions})
 			return
 		}
 		if fmt.Sprint(body.ToolChoice) == "required" {
@@ -1409,7 +1419,7 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 						calls[i].ID = scopedCallID(calls[i].Name, string(calls[i].Arguments), i, scope)
 					}
 					calls = limitToolCalls(calls, adaptiveToolCallLimit(calls, configuredToolCallLimit(s.settings)))
-					_ = writeToolResponse(w, toolResponse{ID: "chatcmpl-" + uuid.NewString(), Model: firstNonEmpty(body.Model, "m365-copilot"), Stream: body.Stream, Calls: calls, Result: retryRes, Prompt: prompt})
+					_ = writeToolResponse(w, toolResponse{ID: "chatcmpl-" + uuid.NewString(), Model: firstNonEmpty(body.Model, "m365-copilot"), Stream: body.Stream, Calls: calls, Result: retryRes, Prompt: prompt, Options: body.StreamOptions})
 					return
 				}
 			}
@@ -1441,6 +1451,7 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 		}
 		id := "chatcmpl-" + uuid.NewString()
 		model := firstNonEmpty(body.Model, "m365-copilot")
+		usage := newStreamUsage(body.StreamOptions, answerPrompt)
 		firstDelta := true
 		writeChunk := func(delta map[string]any) error {
 			if err := r.Context().Err(); err != nil {
@@ -1456,7 +1467,7 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 				}
 				delta = withRole
 			}
-			chunk := map[string]any{"id": id, "object": "chat.completion.chunk", "created": time.Now().Unix(), "model": model, "choices": []map[string]any{{"index": 0, "delta": delta}}}
+			chunk := usage.decorate(map[string]any{"id": id, "object": "chat.completion.chunk", "created": time.Now().Unix(), "model": model, "choices": []map[string]any{{"index": 0, "delta": delta}}})
 			rc := http.NewResponseController(w)
 			_ = rc.SetWriteDeadline(time.Now().Add(30 * time.Second))
 			if _, err := fmt.Fprintf(w, "data: %s\n\n", mustJSON(chunk)); err != nil {
@@ -1467,12 +1478,14 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 		}
 		onDelta := func(content string) error {
 			if content != "" {
+				usage.addCompletion(content)
 				return writeChunk(map[string]any{"content": content})
 			}
 			return nil
 		}
 		onReasoning := func(reasoning string) error {
 			if reasoning != "" {
+				usage.addCompletion(reasoning)
 				return writeChunk(map[string]any{"reasoning_content": reasoning})
 			}
 			return nil
@@ -1483,7 +1496,7 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 		res, err = s.chat.ChatWithReasoning(ctx, account, answerReq, onDelta, onReasoning)
 		if err == nil {
 			s.accountPool.MarkSuccess(acc.ID)
-			writeStreamFinish(r.Context(), w, flusher, id, model)
+			writeStreamFinish(r.Context(), w, flusher, id, model, usage)
 			_ = sseRaw(r.Context(), w, flusher, "data: [DONE]\n\n")
 		} else {
 			log.Printf("[req-trace] id=%s stage=stream_error err=%v", requestID, err)
@@ -1559,12 +1572,12 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 		calls = limitToolCalls(calls, adaptiveToolCallLimit(calls, configuredToolCallLimit(s.settings)))
 		// res.Text is the model's own answer here, so any prose around the call
 		// syntax is a preamble the client should still see.
-		_ = writeToolResponse(w, toolResponse{ID: id, Model: model, Stream: body.Stream, Calls: calls, Result: res, Preamble: toolPreamble(res.Text, toolMaps), Prompt: prompt})
+		_ = writeToolResponse(w, toolResponse{ID: id, Model: model, Stream: body.Stream, Calls: calls, Result: res, Preamble: toolPreamble(res.Text, toolMaps), Prompt: prompt, Options: body.StreamOptions})
 		return
 	}
 	if calls := nativeToolCalls(res.Events, body.Tools); len(calls) > 0 {
 		calls = limitToolCalls(calls, adaptiveToolCallLimit(calls, configuredToolCallLimit(s.settings)))
-		_ = writeToolResponse(w, toolResponse{ID: id, Model: model, Stream: body.Stream, Calls: calls, Result: res, Preamble: toolPreamble(res.Text, toolMaps), Prompt: prompt})
+		_ = writeToolResponse(w, toolResponse{ID: id, Model: model, Stream: body.Stream, Calls: calls, Result: res, Preamble: toolPreamble(res.Text, toolMaps), Prompt: prompt, Options: body.StreamOptions})
 		return
 	}
 	// Recover natural-language tool intent when native mode emits no
@@ -1588,7 +1601,7 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 				calls = limitToolCalls(calls, adaptiveToolCallLimit(calls, configuredToolCallLimit(s.settings)))
 				// The call was recovered from res.Text, the model's own prose, so
 				// that prose is the preamble. routeRes only carried the decision.
-				_ = writeToolResponse(w, toolResponse{ID: id, Model: model, Stream: body.Stream, Calls: calls, Result: routeRes, Preamble: toolPreamble(res.Text, toolMaps), Prompt: prompt})
+				_ = writeToolResponse(w, toolResponse{ID: id, Model: model, Stream: body.Stream, Calls: calls, Result: routeRes, Preamble: toolPreamble(res.Text, toolMaps), Prompt: prompt, Options: body.StreamOptions})
 				return
 			}
 		}
@@ -1615,8 +1628,10 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 			http.Error(w, "stream unsupported", http.StatusInternalServerError)
 			return
 		}
+		usage := newStreamUsage(body.StreamOptions, prompt)
+		usage.addCompletion(res.Text)
 		// one-shot "stream" — emit full content then done
-		chunk := map[string]any{
+		chunk := usage.decorate(map[string]any{
 			"id":      id,
 			"object":  "chat.completion.chunk",
 			"created": created,
@@ -1625,10 +1640,10 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 				"index": 0,
 				"delta": map[string]any{"role": "assistant", "content": res.Text},
 			}},
-		}
+		})
 		b, _ := json.Marshal(chunk)
 		_ = sseRaw(r.Context(), w, flusher, "data: "+string(b)+"\n\n")
-		writeStreamFinish(r.Context(), w, flusher, id, model)
+		writeStreamFinish(r.Context(), w, flusher, id, model, usage)
 		_ = sseRaw(r.Context(), w, flusher, "data: [DONE]\n\n")
 		return
 	}
