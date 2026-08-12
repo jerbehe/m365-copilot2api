@@ -815,15 +815,15 @@ func (s *Server) chatOnce(w http.ResponseWriter, r *http.Request) {
 				if err2 == nil {
 					s.accountPool.MarkFailure(acc.ID, err, rateLimitCooldown)
 					s.accountPool.MarkSuccess(next.ID)
-					jsonOut(w, map[string]any{
-						"status": "ok", "text": res2.Text, "conversationId": res2.ConversationID,
-						"sessionId": res2.SessionID, "requestId": res2.RequestID,
-						"throttling": res2.Throttling, "result": res2.RawResult, "events": res2.Events,
-						"images": res2.Images, "account": map[string]any{"id": next.ID, "email": next.Email},
-					})
-					return
+					// Continue on the replacement account instead of answering
+					// here, so the shared success path below still runs its
+					// session bookkeeping for a failed-over request.
+					acc = next
+					res = res2
+					err = nil
+				} else {
+					err = err2
 				}
-				err = err2
 			}
 		}
 		s.accountPool.MarkFailure(acc.ID, err, rateLimitCooldown)
@@ -1483,6 +1483,12 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 					acc = next
 					err = nil
 					s.accountPool.MarkSuccess(next.ID)
+				} else {
+					// Report the replacement account's failure: the original error
+					// is already known to be a rate limit or auth failure, and
+					// hiding err2 made a failed failover look like the first
+					// attempt had succeeded.
+					err = err2
 				}
 			}
 		}
@@ -1492,6 +1498,7 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 		writeUpstreamError(w, err)
 		return
 	}
+	s.accountPool.MarkSuccess(acc.ID)
 	if body.Stream {
 		if body.User != "" && res.ConversationID != "" {
 			s.userSessions.Put(body.User, res.ConversationID, res.SessionID, acc.ID)
