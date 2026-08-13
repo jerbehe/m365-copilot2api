@@ -152,13 +152,20 @@ func (r responsesRequest) openAIWithCompaction() (oaiReq, bool, error) {
 			continue
 		}
 		f := map[string]any{"name": t["name"], "description": t["description"], "parameters": t["parameters"]}
-		if typ == "custom" && name == "exec" {
+		switch {
+		case typ == "custom" && name == "exec":
 			// ChatHub accepts JSON function arguments while Codex exec accepts a
 			// grammar-constrained raw input string. Preserve the distinction in
 			// Tool.Type and bridge the input through a single string field.
-			f["parameters"] = map[string]any{"type": "object", "properties": map[string]any{"input": map[string]any{"type": "string"}}, "required": []string{"input"}, "additionalProperties": false}
+			f["parameters"] = grammarToolParameters()
 			hasCustomExec = true
-		} else if typ != "function" {
+		case isGrammarTool(t):
+			// Other grammar tools (Codex apply_patch) bridge the same way. Dropping
+			// them left the model with no way to edit a file, so it narrated the
+			// patch as prose and the client rendered a half-parsed heredoc.
+			f["parameters"] = grammarToolParameters()
+			f["description"] = grammarToolDescription(t)
+		case typ != "function":
 			continue
 		}
 		b, _ := json.Marshal(f)
@@ -168,6 +175,30 @@ func (r responsesRequest) openAIWithCompaction() (oaiReq, bool, error) {
 		o.Messages = append([]oaiMsg{{Role: "system", Content: customExecWorkspaceInstruction}}, o.Messages...)
 	}
 	return o, false, nil
+}
+
+// grammarToolParameters is the JSON schema a grammar-constrained tool is bridged
+// through: ChatHub only accepts JSON arguments, so the raw body travels as one
+// string field and is unwrapped again when the call is detected.
+func grammarToolParameters() map[string]any {
+	return map[string]any{"type": "object", "properties": map[string]any{"input": map[string]any{"type": "string"}}, "required": []string{"input"}, "additionalProperties": false}
+}
+
+// grammarToolDescription appends the tool's grammar to its description. The model
+// cannot see format.definition once the tool is bridged to a JSON schema, and
+// without the grammar it invents its own wrapper — a shell heredoc, most often.
+func grammarToolDescription(t map[string]any) string {
+	desc, _ := t["description"].(string)
+	format, _ := t["format"].(map[string]any)
+	definition, _ := format["definition"].(string)
+	if strings.TrimSpace(definition) == "" {
+		return desc
+	}
+	syntax, _ := format["syntax"].(string)
+	if syntax == "" {
+		syntax = "grammar"
+	}
+	return strings.TrimSpace(desc) + "\n\nPut the body in the \"input\" field verbatim, with no surrounding shell command, heredoc, or code fence. It must match this " + syntax + " grammar:\n" + strings.TrimSpace(definition)
 }
 
 // flattenAdditionalTools unwraps a Codex `additional_tools` input item. Its

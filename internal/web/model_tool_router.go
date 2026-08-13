@@ -13,7 +13,13 @@ func modelToolRouterPrompt(prompt string, tools []map[string]any, choice any) st
 - If no tool is needed, respond with: NO_TOOL_NEEDED
 - Only use tools from the available list above
 - Validate all arguments against the tool's schema
-- Do not invent tools that are not in the list`
+- Do not invent tools that are not in the list
+- Respond with the marker alone. Do not explain, announce, or restate which tool
+  you are choosing: the answer is consumed by a program, not read by a person,
+  and a sentence like "I will use the shell tool to check the files" is discarded
+  as neither a call nor an answer
+- CALL_TOOL requires the parenthesised argument object. The tool name on its own
+  is not a call`
 	// Multi-turn: completed tool evidence (tool[...], tool_calls:) was already
 	// acted upon, so re-invoking those tools would duplicate work.
 	if strings.Contains(prompt, "tool_calls:") || strings.Contains(prompt, "tool[call_") {
@@ -32,6 +38,27 @@ Rules:
 
 User request and evidence:
 %s`, defs, mode, rules, prompt)
+}
+
+// parseNamedToolWithoutArguments reports whether text is a bare CALL_TOOL marker
+// naming a declared tool with no argument object. Such a fragment cannot become a
+// call, and it must not become prose either.
+func parseNamedToolWithoutArguments(text string, tools []map[string]any, choice any) bool {
+	upper := strings.ToUpper(text)
+	if !strings.Contains(upper, "CALL_TOOL") {
+		return false
+	}
+	if strings.Contains(text, "(") {
+		// An argument list is present; a failure to parse it belongs to the
+		// envelope path above, which has already run.
+		return false
+	}
+	for name := range allowedToolNames(tools) {
+		if name != "" && strings.Contains(text, name) && toolChoiceAllows(choice, name) {
+			return true
+		}
+	}
+	return false
 }
 
 func parseModelToolDecision(text string, tools []map[string]any, choice any) ([]detectedToolCall, bool) {
@@ -58,6 +85,13 @@ func parseModelToolDecision(text string, tools []map[string]any, choice any) ([]
 		}
 	}
 	if strings.Contains(text, "NO_TOOL_NEEDED") || strings.Contains(text, "no_tool_needed") {
+		return nil, true
+	}
+	// "CALL_TOOL shell_command" — the marker and a tool name, but no argument
+	// object. It is a decision the model failed to complete, not an answer, so
+	// report it as parsed with no call: the caller then falls through to the
+	// answer turn instead of forwarding the fragment as prose.
+	if calls := parseNamedToolWithoutArguments(text, tools, choice); calls {
 		return nil, true
 	}
 	// The model sometimes answers with the client's own fenced call syntax

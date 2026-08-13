@@ -1223,6 +1223,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		// answers "was any prose delivered", because a reasoning delta also claims
 		// it, and reasoning is not an answer.
 		textEmitted := false
+		narration := newNarrationGate(toolMaps)
 		// writeDelta emits one chunk, stamping the assistant role onto whichever
 		// delta happens to be first: a reasoning delta may precede any text.
 		writeDelta := func(delta map[string]any) error {
@@ -1243,6 +1244,12 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			return nil
 		}
 		emitText := func(part string) error {
+			if part == "" {
+				return nil
+			}
+			// Tool-selection narration must not reach the client: no call follows it,
+			// so the turn would announce work and then stop.
+			part = narration.Feed(stripToolProtocolMarkers(part))
 			if part == "" {
 				return nil
 			}
@@ -1344,6 +1351,14 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 				log.Printf("[req-trace] id=%s stage=stream_write err=%v", requestID, err)
 				return
 			}
+			// A call did materialize, so anything the narration gate held back was a
+			// preamble to it after all, not a dead-end announcement. Release it.
+			if held, _ := narration.Close(); held != "" {
+				if err := emitText(held); err != nil {
+					log.Printf("[req-trace] id=%s stage=stream_write err=%v", requestID, err)
+					return
+				}
+			}
 			calls = limitToolCalls(calls, adaptiveToolCallLimit(calls, configuredToolCallLimit(s.settings)))
 			// The preamble already went out as content deltas, including the tail
 			// released just above. Re-sending it here would duplicate it.
@@ -1354,10 +1369,19 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			s.bindConversation(acc, &body, r, res, answerPrompt, startedAt)
 			return
 		}
-		// No parser claimed a call, so a withheld fence was unusable tool syntax
-		// rather than prose. No text having been emitted means the whole answer was
-		// tool syntax. An empty stream looks like a hang, so say why no call was
-		// produced.
+		// No call was produced. Whatever the gate still holds was only a
+		// tool-selection announcement, so replace it rather than deliver a turn
+		// that promises work and stops.
+		held, narrated := narration.Close()
+		if narrated {
+			log.Printf("[req-trace] id=%s stage=stream_narration_withheld text=%q", requestID, held)
+			tail = toolNarrationNotice
+		} else if held != "" {
+			tail = held + tail
+		}
+		// A withheld fence was unusable tool syntax rather than prose. No text
+		// having been emitted means the whole answer was tool syntax. An empty
+		// stream looks like a hang, so say why no call was produced.
 		if withheld && !textEmitted && strings.TrimSpace(tail) == "" {
 			tail = withheldToolFenceNotice
 		}
@@ -1476,7 +1500,11 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 			flusher.Flush()
 			return nil
 		}
+		narration := newNarrationGate(toolMaps)
 		onDelta := func(content string) error {
+			// This branch runs after tool routing already declined to call a tool, so
+			// narration here leads nowhere and must not reach the client.
+			content = narration.Feed(stripToolProtocolMarkers(content))
 			if content != "" {
 				usage.addCompletion(content)
 				return writeChunk(map[string]any{"content": content})
@@ -1496,6 +1524,14 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 		res, err = s.chat.ChatWithReasoning(ctx, account, answerReq, onDelta, onReasoning)
 		if err == nil {
 			s.accountPool.MarkSuccess(acc.ID)
+			if held, narrated := narration.Close(); held != "" {
+				if narrated {
+					log.Printf("[req-trace] id=%s stage=stream_narration_withheld text=%q", requestID, held)
+					held = toolNarrationNotice
+				}
+				usage.addCompletion(held)
+				_ = writeChunk(map[string]any{"content": held})
+			}
 			writeStreamFinish(r.Context(), w, flusher, id, model, usage)
 			_ = sseRaw(r.Context(), w, flusher, "data: [DONE]\n\n")
 		} else {
@@ -1615,6 +1651,14 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 	if stripped, withheld := withholdToolFences(res.Text, toolMaps); withheld {
 		log.Printf("[req-trace] id=%s stage=fence_withheld original=%d emitted=%d", requestID, len(res.Text), len(stripped))
 		res.Text = stripped
+	}
+	// A turn that only announced which tool it would use is not an answer either:
+	// no call was produced, so the client would show the announcement and stop.
+	if isToolIntentNarration(res.Text, toolMaps) {
+		log.Printf("[req-trace] id=%s stage=narration_withheld text=%q", requestID, res.Text)
+		res.Text = toolNarrationNotice
+	} else {
+		res.Text = stripToolProtocolMarkers(res.Text)
 	}
 	log.Printf("[debug] res.Text bytes=%d content=%q", len(res.Text), res.Text)
 	created := time.Now().Unix()

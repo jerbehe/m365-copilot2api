@@ -56,6 +56,13 @@ func fencedToolCalls(text string, tools []map[string]any, choice any) []detected
 	allowed := allowedToolNames(tools)
 	shell := declaredShell(allowed)
 	var out []detectedToolCall
+	// A patch envelope is not fenced: the grammar emits it as bare text, so it has
+	// to be claimed before the fence scan or it reaches the client as prose.
+	if allowed[applyPatchToolName] && toolChoiceAllows(choice, applyPatchToolName) {
+		if patch, _, _, ok := applyPatchEnvelope(text); ok {
+			out = append(out, applyPatchCall(patch, len(out)))
+		}
+	}
 	for _, m := range fencedToolCall.FindAllStringSubmatch(text, -1) {
 		name := m[1]
 		args := strings.TrimSpace(m[2])
@@ -158,9 +165,17 @@ const withheldToolFenceNotice = "上游返回的是无法执行的工具调用�
 func stripToolFences(text string, tools []map[string]any) (string, bool) {
 	allowed := allowedToolNames(tools)
 	shell := declaredShell(allowed)
+	withheld := false
+	// The patch envelope is bare text, so it is removed by span rather than by
+	// the fence pattern.
+	if allowed[applyPatchToolName] {
+		if _, start, end, ok := applyPatchEnvelope(text); ok {
+			text = text[:start] + text[end:]
+			withheld = true
+		}
+	}
 	var b strings.Builder
 	last := 0
-	withheld := false
 	for _, loc := range fencedToolCall.FindAllStringSubmatchIndex(text, -1) {
 		name := text[loc[2]:loc[3]]
 		if !allowed[name] && !(isShellFenceName(name) && shell != "") {
@@ -170,8 +185,8 @@ func stripToolFences(text string, tools []map[string]any) (string, bool) {
 		last = loc[1]
 		withheld = true
 	}
-	if !withheld {
-		return text, false
+	if last == 0 {
+		return text, withheld
 	}
 	b.WriteString(text[last:])
 	return b.String(), true
