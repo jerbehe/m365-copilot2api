@@ -113,6 +113,31 @@ func writeResponsesResult(w http.ResponseWriter, model string, stream bool, src 
 	emit("response.completed", map[string]any{"type": "response.completed", "response": resp})
 }
 
+// Message phases classify assistant text within one turn. Clients render
+// commentary as progress and only treat a final answer as the turn's result.
+//
+// The field is optional in the protocol, and its absence means "phase unknown",
+// which conforming clients must handle by assuming a final answer. Leaving it out
+// therefore made every mid-turn preamble render as another finished answer,
+// interleaved with the real one.
+const (
+	messagePhaseCommentary  = "commentary"
+	messagePhaseFinalAnswer = "final_answer"
+)
+
+// assistantMessageItem builds a Responses message output item. phase says whether
+// this text is mid-turn narration or the turn's answer.
+func assistantMessageItem(id, text, phase string) map[string]any {
+	return map[string]any{
+		"type":    "message",
+		"id":      id,
+		"role":    "assistant",
+		"status":  "completed",
+		"phase":   phase,
+		"content": []any{map[string]any{"type": "output_text", "text": text, "annotations": []any{}}},
+	}
+}
+
 // responsesOutputItems projects one internal completion into Responses output
 // items. A turn that both narrates and calls a tool produces both: the message
 // first, then the calls. Emitting only the calls loses the model's stated intent,
@@ -123,10 +148,16 @@ func responsesOutputItems(msg map[string]any) []any {
 	if reasoning, _ := msg["reasoning_content"].(string); strings.TrimSpace(reasoning) != "" {
 		output = append(output, reasoningOutputItem("rs_"+uuid.NewString(), reasoning))
 	}
-	if text, _ := msg["content"].(string); strings.TrimSpace(text) != "" {
-		output = append(output, map[string]any{"type": "message", "id": "msg_" + uuid.NewString(), "role": "assistant", "status": "completed", "content": []any{map[string]any{"type": "output_text", "text": text, "annotations": []any{}}}})
-	}
 	calls, _ := msg["tool_calls"].([]any)
+	if text, _ := msg["content"].(string); strings.TrimSpace(text) != "" {
+		// Text accompanied by a call is a preamble: the turn continues once the
+		// call returns, so it is commentary rather than the answer.
+		phase := messagePhaseFinalAnswer
+		if len(calls) > 0 {
+			phase = messagePhaseCommentary
+		}
+		output = append(output, assistantMessageItem("msg_"+uuid.NewString(), text, phase))
+	}
 	for _, raw := range calls {
 		tc, _ := raw.(map[string]any)
 		fn, _ := tc["function"].(map[string]any)
@@ -139,7 +170,7 @@ func responsesOutputItems(msg map[string]any) []any {
 	if len(output) == 0 {
 		// A turn with neither text nor a call still needs one item: clients treat a
 		// completed response with an empty output array as a protocol violation.
-		output = append(output, map[string]any{"type": "message", "id": "msg_" + uuid.NewString(), "role": "assistant", "status": "completed", "content": []any{map[string]any{"type": "output_text", "text": "", "annotations": []any{}}}})
+		output = append(output, assistantMessageItem("msg_"+uuid.NewString(), "", messagePhaseFinalAnswer))
 	}
 	return output
 }

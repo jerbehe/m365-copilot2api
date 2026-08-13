@@ -187,7 +187,15 @@ func translateResponsesStream(emit func(string, any) error, model string, o oaiR
 		_ = emit("response.output_item.done", map[string]any{"type": "response.output_item.done", "output_index": reasoningIndex, "item": item})
 	}
 	if textStarted {
-		item := map[string]any{"type": "message", "id": messageID, "role": "assistant", "status": "completed", "content": []any{map[string]any{"type": "output_text", "id": contentID, "text": text.String(), "annotations": []any{}}}}
+		// The phase is only knowable now: text accompanied by a call is a preamble
+		// to it, so the turn continues and this is commentary rather than the
+		// answer. output_item.added had to go out before any call arrived, so it
+		// carried no phase; the terminal item is where clients read it.
+		phase := messagePhaseFinalAnswer
+		if len(calls) > 0 {
+			phase = messagePhaseCommentary
+		}
+		item := map[string]any{"type": "message", "id": messageID, "role": "assistant", "status": "completed", "phase": phase, "content": []any{map[string]any{"type": "output_text", "id": contentID, "text": text.String(), "annotations": []any{}}}}
 		output = append(output, item)
 		_ = emit("response.output_text.done", map[string]any{"type": "response.output_text.done", "output_index": textIndex, "content_index": 0, "item_id": messageID, "text": text.String()})
 		_ = emit("response.output_item.done", map[string]any{"type": "response.output_item.done", "output_index": textIndex, "item": item})
