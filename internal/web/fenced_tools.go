@@ -174,6 +174,14 @@ func stripToolFences(text string, tools []map[string]any) (string, bool) {
 			withheld = true
 		}
 	}
+	// An unfenced grammar body occupies the whole answer, so claiming it leaves
+	// nothing to forward. Withholding it here is what keeps the escaped source out
+	// of the assistant message.
+	if !withheld {
+		if _, ok := grammarBodyCall(text, tools, nil); ok {
+			return "", true
+		}
+	}
 	var b strings.Builder
 	last := 0
 	for _, loc := range fencedToolCall.FindAllStringSubmatchIndex(text, -1) {

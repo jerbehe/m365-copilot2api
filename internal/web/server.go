@@ -1335,7 +1335,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		}
 		calls := streamedTools
 		if len(calls) == 0 {
-			calls = fencedToolCalls(text.String(), toolMaps, body.ToolChoice)
+			calls = answerToolCalls(text.String(), toolMaps, body.ToolChoice)
 		}
 		// The tail of the answer is still buffered: emitText always holds back the
 		// last few runes so a tool fence can be recognised before it is forwarded as
@@ -1604,7 +1604,7 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 		model = "m365-copilot"
 	}
 	id := "chatcmpl-" + uuid.NewString()
-	if calls := fencedToolCalls(res.Text, toolMaps, body.ToolChoice); len(calls) > 0 {
+	if calls := answerToolCalls(res.Text, toolMaps, body.ToolChoice); len(calls) > 0 {
 		calls = limitToolCalls(calls, adaptiveToolCallLimit(calls, configuredToolCallLimit(s.settings)))
 		// res.Text is the model's own answer here, so any prose around the call
 		// syntax is a preamble the client should still see.
