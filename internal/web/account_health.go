@@ -85,8 +85,12 @@ func (h *accountHealth) MarkFailure(accountID string, err error, window time.Dur
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if IsAuthFailure(err) {
-		h.authFail[accountID] = true
-		delete(h.cooldown, accountID)
+		cooldown := window
+		if cooldown > 2*time.Minute {
+			cooldown = 2 * time.Minute
+		}
+		h.cooldown[accountID] = time.Now().Add(cooldown)
+		delete(h.authFail, accountID)
 		return
 	}
 	if IsRateLimited(err) {
