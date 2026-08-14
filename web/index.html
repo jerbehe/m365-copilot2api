@@ -678,6 +678,7 @@ if (response.output_text) {
 const $=id=>document.getElementById(id);
 const pages={dashboard:'Dashboard',usage:'Usage',accounts:'Accounts',apikeys:'API Keys',conversations:'Conversations',proxies:'Proxy Pool',modeltest:'Model Test',settings:'Settings'};
 const localeStorageKey='m365_locale';
+const localeSelectionKey='m365_locale_selected';
 const SUPPORTED_LOCALES=['en','zh-CN','zh-TW','ja','ko','es','fr','de','pt-BR','ru','ar'];
 const localeText={
   'Administrator Login': {'zh-CN':'管理员登录','zh-TW':'管理員登入','ja':'管理者ログイン','ko':'관리자 로그인','es':'Inicio de sesión de administrador','fr':'Connexion administrateur','de':'Administrator-Anmeldung','pt-BR':'Login de administrador','ru':'Вход администратора','ar':'تسجيل دخول المسؤول'},
@@ -849,7 +850,15 @@ const localeText={
   'Testing…': {'zh-CN':'测试中…','zh-TW':'測試中…','ja':'テスト中…','ko':'테스트 중…','es':'Probando…','fr':'Test en cours…','de':'Wird getestet…','pt-BR':'Testando…','ru':'Тестирование…','ar':'جارٍ الاختبار…'},
   'Failed': {'zh-CN':'失败','zh-TW':'失敗','ja':'失敗','ko':'실패','es':'Fallido','fr':'Échec','de':'Fehlgeschlagen','pt-BR':'Falhou','ru':'Ошибка','ar':'فشل'}
 };
-let currentLocale='en';
+function preferredLocale(){
+  try{
+    const stored=localStorage.getItem(localeStorageKey);
+    if(stored==='en'&&localStorage.getItem(localeSelectionKey)==='1')return 'en';
+    if(stored&&stored!=='en'&&SUPPORTED_LOCALES.includes(stored))return stored;
+  }catch(e){}
+  return 'zh-CN';
+}
+let currentLocale=preferredLocale();
 let localeObserver=null;
 function localeReverse(){const out={};Object.entries(localeText).forEach(([en,v])=>{if(v&&typeof v==='object'){Object.values(v).forEach(t=>{if(t&&!out[t])out[t]=en;});}else if(v&&!out[v]){out[v]=en;}});return out;}
 const localeTextReverse=localeReverse();
@@ -910,9 +919,13 @@ function applyLocale(locale){
   translatePage();
   if(!localeObserver){localeObserver=new MutationObserver(()=>translatePage());localeObserver.observe(document.body,{childList:true,subtree:true,characterData:true});}
 }
-try{const l=localStorage.getItem(localeStorageKey);currentLocale=SUPPORTED_LOCALES.includes(l)?l:'en';}catch(e){}
 applyLocale(currentLocale);
-document.addEventListener('change',e=>{if(e.target?.id==='languageSelect')applyLocale(e.target.value);});
+document.addEventListener('change',e=>{
+  if(e.target?.id==='languageSelect'){
+    try{localStorage.setItem(localeSelectionKey,'1');}catch(err){}
+    applyLocale(e.target.value);
+  }
+});
 let pkceTimer=null;
 
 function showNotice(msg,type='info'){

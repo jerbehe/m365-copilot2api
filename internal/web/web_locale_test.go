@@ -1,0 +1,25 @@
+package web
+
+import (
+	"os"
+	"strings"
+	"testing"
+)
+
+func TestWebIndexDefaultsToChineseUntilLocaleIsSelected(t *testing.T) {
+	body, err := os.ReadFile("../../web/index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	page := string(body)
+	for _, needle := range []string{
+		"const localeSelectionKey='m365_locale_selected';",
+		"function preferredLocale()",
+		"return 'zh-CN';",
+		"localStorage.setItem(localeSelectionKey,'1')",
+	} {
+		if !strings.Contains(page, needle) {
+			t.Fatalf("web index missing Chinese default bootstrap %q", needle)
+		}
+	}
+}
