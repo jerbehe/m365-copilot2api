@@ -983,7 +983,14 @@ async function api(path,opts={}){
 $('loginForm')?.addEventListener('submit',async e=>{
   e.preventDefault();
   try{
-    await api('/api/admin/login',{method:'POST',body:JSON.stringify({password:$('loginPassword').value})});
+    const d=await api('/api/admin/login',{method:'POST',body:JSON.stringify({password:$('loginPassword').value})});
+    if(d.must_change_password){
+      const np=prompt('You must change the default password before continuing.\nEnter new password (min 6 characters):');
+      if(!np||np.length<6){showNotice('Password must be at least 6 characters','error');return;}
+      await api('/api/admin/change-password',{method:'POST',body:JSON.stringify({current_password:$('loginPassword').value,new_password:np})});
+      showNotice('Password changed. Please log in again with the new password.','success');
+      return;
+    }
     $('login').style.display='none';$('app').style.display='flex';
     showPage('dashboard');loadStats();
     showNotice('Logged in successfully','success');
