@@ -284,7 +284,8 @@ body{background:var(--bg);color:var(--text);font-family:"Inter","SF Pro Display"
     <form id="loginForm" style="background:var(--surface);-webkit-backdrop-filter:blur(40px) saturate(180%);backdrop-filter:blur(40px) saturate(180%);border:1px solid var(--surface-border);border-radius:var(--radius);padding:32px;box-shadow:var(--shadow-lg)">
       <div class="form-group">
         <label class="form-label">Password</label>
-        <input class="form-input" id="loginPassword" type="password" placeholder="Enter administrator password" autofocus>
+        <input class="form-input" id="loginPassword" type="password" placeholder="Enter administrator password (default: admin123)" autofocus>
+        <div class="form-hint" style="margin-top:4px">Default password is <code>admin123</code>. You will be required to change it after first login.</div>
       </div>
       <button type="submit" class="btn primary" style="width:100%;margin-top:8px">Log in</button>
     </form>
@@ -351,13 +352,13 @@ if (response.output_text) {
               <button class="onb-step" id="onb-s1" onclick="onbStep1()">
                 <span class="onb-step-num" id="onb-n1">1</span>
                 <span class="onb-step-icon"><i data-lucide="user-plus" style="width:15px;height:15px"></i></span>
-                <span class="onb-step-text"><b>Add an account</b><p>Authorize a Microsoft account and add it to the available pool</p></span>
+                <span class="onb-step-text"><b>Add a Microsoft account</b><p>Sign in via browser OAuth and add the account to the pool</p></span>
                 <svg class="onb-step-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14"/><path d="m12 5 7 7-7 7"/></svg>
               </button>
               <button class="onb-step" id="step-s2" onclick="onbStep2()">
                 <span class="onb-step-num" id="onb-n2">2</span>
                 <span class="onb-step-icon"><i data-lucide="key-round" style="width:15px;height:15px"></i></span>
-                <span class="onb-step-text"><b>Create an API key</b><p>Create an access key for this application or service</p></span>
+                <span class="onb-step-text"><b>Create an API key</b><p>Generate a key to authenticate API requests</p></span>
                 <svg class="onb-step-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14"/><path d="m12 5 7 7-7 7"/></svg>
               </button>
               <button class="onb-step" id="step-s3" onclick="onbStep3()">
@@ -416,11 +417,11 @@ if (response.output_text) {
             <div class="quick-grid">
               <div class="quick-action" onclick="showPage('accounts');setTimeout(startPKCE,200)">
                 <div class="quick-action-icon blue"><i data-lucide="plus" style="width:18px;height:18px"></i></div>
-                <div class="quick-action-text"><h4>Add account</h4><p>Authorize a Microsoft account</p></div>
+                <div class="quick-action-text"><h4>Add account</h4><p>Sign in via Microsoft OAuth</p></div>
               </div>
               <div class="quick-action" onclick="openKeyModal()">
                 <div class="quick-action-icon green"><i data-lucide="key" style="width:18px;height:18px"></i></div>
-                <div class="quick-action-text"><h4>Create API key</h4><p>Generate a new access key</p></div>
+                <div class="quick-action-text"><h4>Create API key</h4><p>Generate a key for API access</p></div>
               </div>
               <div class="quick-action" onclick="showPage('conversations')">
                 <div class="quick-action-icon purple"><i data-lucide="trash-2" style="width:18px;height:18px"></i></div>
@@ -493,27 +494,27 @@ if (response.output_text) {
               <div class="onb-step">
                 <span class="onb-step-num">1</span>
                 <span class="onb-step-icon"><i data-lucide="mouse-pointer-click" style="width:15px;height:15px"></i></span>
-                <span class="onb-step-text"><b>Click "Start authorization" below</b><p>Your browser will open the Microsoft sign-in page</p></span>
+                <span class="onb-step-text"><b>Click "Start authorization" below</b><p>A popup will open the Microsoft sign-in page. Complete sign-in there, then come back to this page.</p></span>
               </div>
               <div class="onb-step">
                 <span class="onb-step-num">2</span>
                 <span class="onb-step-icon"><i data-lucide="clipboard-copy" style="width:15px;height:15px"></i></span>
-                <span class="onb-step-text"><b>Copy the full callback URL</b><p>After signing in, copy the full URL beginning with http from the address bar</p></span>
+                <span class="onb-step-text"><b>Copy the callback URL from the popup's address bar</b><p>After signing in, the popup will show a blank or error page — this is normal. Copy the full URL from the <b>popup's address bar</b> (it contains <code>code=...</code> and <code>state=...</code>).</p></span>
               </div>
               <div class="onb-step">
                 <span class="onb-step-num">3</span>
                 <span class="onb-step-icon"><i data-lucide="check-check" style="width:15px;height:15px"></i></span>
-                <span class="onb-step-text"><b>Paste and confirm</b><p>Paste it below and click "Confirm and add" to finish authorization</p></span>
+                <span class="onb-step-text"><b>Paste and confirm</b><p>Paste it into the Callback URL field below and click "Confirm and add" to finish authorization</p></span>
               </div>
             </div>
             <button class="btn primary" onclick="startPKCE()" style="width:100%;margin-bottom:12px;"><i data-lucide="link" style="width:15px;height:15px"></i> Start authorization</button>
             <div class="highlight-box warning" style="margin-top:0;margin-bottom:16px">
-              <div class="highlight-box-title"><i data-lucide="alert-circle" style="width:14px;height:14px"></i> Important</div>
-              <p>After authorization, <strong>ignore the content of the popup page</strong> and copy the full callback URL from the browser address bar, including the <code>code</code> and <code>state</code> parameters.</p>
+              <div class="highlight-box-title"><i data-lucide="alert-circle" style="width:14px;height:14px"></i> You must manually paste the callback URL to complete authorization</div>
+              <p>After signing in on the popup, it will display a blank or error page — <strong>this is normal</strong> because the callback endpoint is not a real website. The authorization is <strong>not</strong> complete yet. Copy the <strong>full URL from the popup's address bar</strong> (it will look like <code>http://localhost:4141/api/auth/callback?code=M.C5...&state=abc123</code>) and paste it into the Callback URL field below.</p>
             </div>
             <label class="form-label">Callback URL</label>
             <div class="copy-field">
-              <input class="form-input" id="callbackInput" placeholder="Paste the full callback URL, e.g. https://app.example.com/api/auth/callback?code=...&state=..." autocomplete="off">
+              <input class="form-input" id="callbackInput" placeholder="Paste the full callback URL, e.g. http://localhost:4141/api/auth/callback?code=M.C5...&state=abc123" autocomplete="off">
               <button class="btn primary" onclick="submitCallback()" style="min-width:96px">Confirm and add</button>
             </div>
             <div id="authStatus" style="margin-top:12px"></div>
@@ -617,11 +618,12 @@ if (response.output_text) {
 <div class="modal-overlay" id="keyModal">
   <div class="modal">
     <h3>Create API key</h3>
-    <p class="subtitle">The key is shown only once. Store it securely.</p>
+    <p class="subtitle">This key authenticates requests to the OpenAI / Anthropic compatible API. The full key is shown only once — copy and save it now. After creation, click "Use key" in the key list for client configuration examples.</p>
     <form onsubmit="createKey(event)">
       <div class="form-group">
         <label class="form-label">Name</label>
         <input class="form-input" id="keyName" value="default" autofocus>
+        <div class="form-hint">A label to identify this key (e.g. "my-laptop", "claude-code")</div>
       </div>
       <div class="modal-actions">
         <button type="button" class="btn" onclick="closeKeyModal()">Cancel</button>
@@ -1059,9 +1061,10 @@ async function startPKCE(){
     const d=await api('/api/auth/start');
     $('callbackInput').dataset.state=d.state;
     const popup=window.open(d.url,'pkce','width=600,height=800');
-    $('authStatus').innerHTML='<div class="highlight-box"><div class="highlight-box-title"><i data-lucide="info" style="width:14px;height:14px"></i>Authorization page opened</div><p>Complete the sign-in in your browser, then paste the full callback URL from the address bar into the field above.</p></div>';
+    if(!popup){$('authStatus').innerHTML='<div class="highlight-box warning"><div class="highlight-box-title"><i data-lucide="alert-circle" style="width:14px;height:14px"></i>Popup blocked by browser</div><p>Please allow popups for this site, then click "Start authorization" again.</p></div>';lucide.createIcons();return;}
+    $('authStatus').innerHTML='<div class="highlight-box"><div class="highlight-box-title"><i data-lucide="info" style="width:14px;height:14px"></i>Authorization page opened in a new window</div><p>Complete the sign-in in the popup. After signing in, the popup will show a blank or error page — this is normal. Copy the <b>full URL from the popup's address bar</b> and paste it into the Callback URL field below.</p></div>';
     $('callbackInput').focus();
-    $('callbackInput').placeholder='Paste the full callback URL from the address bar…';
+    $('callbackInput').placeholder='Paste the full callback URL from the popup address bar…';
     if(pkceTimer)clearInterval(pkceTimer);
     const start=Date.now();
     pkceTimer=setInterval(async()=>{
