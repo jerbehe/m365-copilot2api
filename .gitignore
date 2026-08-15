@@ -48,3 +48,9 @@ AGENTS.md
 
 # WIP build during this session
 /m365-copilot2api.new*
+
+*.exe
+*.exe~
+*.bak*
+_wip_backup_*
+*.dll
