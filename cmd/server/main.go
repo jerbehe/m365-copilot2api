@@ -9,11 +9,21 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 )
 
 func main() {
+	// "go run" executes the binary from a temporary go-build directory; only
+	// chdir to the exe directory when the web UI actually ships alongside it.
+	if exe, err := os.Executable(); err == nil {
+		if dir := filepath.Dir(exe); dir != "" {
+			if _, err := os.Stat(filepath.Join(dir, "web", "index.html")); err == nil {
+				os.Chdir(dir)
+			}
+		}
+	}
 	web.ApplyStartupSettingsEnv()
 	if err := outbound.ConfigureFromEnv(); err != nil {
 		log.Fatalf("configure outbound proxy: %v", err)
@@ -24,6 +34,8 @@ func main() {
 	}
 	s.InitM365CloudClient()
 	s.StartAutoCleanup()
+	s.StartConvCacheGC()
+	s.RefreshExpiredTokens()
 	listen := "127.0.0.1:4141"
 	if v := os.Getenv("M365_LISTEN"); v != "" {
 		listen = v

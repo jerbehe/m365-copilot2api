@@ -5,9 +5,20 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strings"
 
 	"m365-copilot2api/internal/auth"
 )
+
+func IsEmptyCompletion(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "empty completion") ||
+		strings.Contains(message, "empty response") ||
+		strings.Contains(message, "before completion")
+}
 
 func logOAuthError(stage string, err error) {
 	var oauthErr *auth.OAuthError
@@ -47,5 +58,17 @@ func writeUpstreamError(w http.ResponseWriter, err error) {
 	if retry := RetryAfterSeconds(err); retry > 0 {
 		w.Header().Set("Retry-After", fmt.Sprintf("%d", retry))
 	}
-	http.Error(w, upstreamError(err), upstreamStatus(err))
+	status := upstreamStatus(err)
+	if status == http.StatusTooManyRequests {
+		if w.Header().Get("Retry-After") == "" {
+			w.Header().Set("Retry-After", fmt.Sprintf("%d", int(rateLimitCooldown.Seconds())))
+		}
+		writeOpenAIError(w, status, "rate_limit_error", "upstream is rate limiting; try again shortly")
+		return
+	}
+	if IsEmptyCompletion(err) {
+		writeOpenAIError(w, http.StatusBadGateway, "upstream_error", "upstream returned empty completion; the requested model may be unavailable for this tenant")
+		return
+	}
+	writeOpenAIError(w, status, "upstream_error", upstreamError(err))
 }

@@ -270,21 +270,30 @@ func (r anthropicRequest) openAI() (oaiReq, error) {
 			case "text":
 				text = append(text, b)
 			case "image":
-				// Anthropic vision blocks use source:{type:base64,
-				// media_type,data}. Normalize them to the shared multimodal
-				// parser's input_image shape without copying image bytes elsewhere.
 				source, _ := b["source"].(map[string]any)
 				if source != nil {
-					data, _ := source["data"].(string)
-					media, _ := source["media_type"].(string)
-					if data != "" {
-						if media == "" {
-							media = "application/octet-stream"
+					srcType, _ := source["type"].(string)
+					switch srcType {
+					case "base64":
+						data, _ := source["data"].(string)
+						media, _ := source["media_type"].(string)
+						if data != "" {
+							if media == "" {
+								media = "application/octet-stream"
+							}
+							text = append(text, map[string]any{
+								"type":      "input_image",
+								"image_url": "data:" + media + ";base64," + data,
+							})
 						}
-						text = append(text, map[string]any{
-							"type":      "input_image",
-							"image_url": "data:" + media + ";base64," + data,
-						})
+					case "url":
+						url, _ := source["url"].(string)
+						if url != "" {
+							text = append(text, map[string]any{
+								"type":      "input_image",
+								"image_url": url,
+							})
+						}
 					}
 				}
 			case "tool_use":

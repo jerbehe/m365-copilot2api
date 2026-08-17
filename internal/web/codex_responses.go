@@ -46,6 +46,7 @@ func emitReasoningSummary(emit func(string, any), outputIndex int, itemID, summa
 func writeResponsesResult(w http.ResponseWriter, model string, stream bool, src map[string]any) {
 	id := firstNonEmpty(mapString(src, "m365_response_id"), "resp_"+uuid.NewString())
 	msg, _ := openAIChoice(src)
+	sanitizePublicAssistantMessage(msg)
 	text, _ := msg["content"].(string)
 	output := responsesOutputItems(msg)
 	usage, _ := src["usage"].(map[string]any)

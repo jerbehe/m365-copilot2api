@@ -1,6 +1,11 @@
 package chathub
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"errors"
+)
+
+var ErrRateLimitNotice = errors.New("chathub rate limit notice")
 
 type Event struct {
 	Type       int             `json:"type,omitempty"`
@@ -49,7 +54,7 @@ func normalize(raw json.RawMessage) Event {
 	case x.Target != "":
 		kind = "target"
 	}
-	return Event{Type: x.Type, Target: x.Target, Invocation: x.Invocation, Kind: kind, Arguments: x.Arguments, Item: x.Item, Error: x.Error, Raw: append(json.RawMessage(nil), raw...)}
+	return Event{Type: x.Type, Target: x.Target, Invocation: x.Invocation, Kind: kind, Arguments: x.Arguments, Item: x.Item, Error: x.Error, Raw: raw}
 }
 
 func NormalizeEvents(raw []json.RawMessage) []Event {

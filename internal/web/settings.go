@@ -110,6 +110,7 @@ var openSettingsStore = sync.OnceValue(func() *settingsStore {
 	}
 	return s
 })
+
 func firstNonEmptySetting(values ...string) string {
 	for _, v := range values {
 		if strings.TrimSpace(v) != "" {

@@ -82,6 +82,75 @@ func Refresh(refreshToken string) (TokenSet, error) {
 	return requestToken(form)
 }
 
+// RefreshWithScope redeems the same account refresh token for a separately
+// consented Microsoft resource, such as the Designer App Service used to
+// download generated images. The caller must persist a rotated refresh token.
+func RefreshWithScope(refreshToken, clientID, scope string) (TokenSet, error) {
+	form := url.Values{}
+	clientID = strings.TrimSpace(clientID)
+	if clientID == "" {
+		clientID = ClientID()
+	}
+	form.Set("client_id", clientID)
+	form.Set("grant_type", "refresh_token")
+	form.Set("refresh_token", refreshToken)
+	form.Set("scope", scope)
+	return requestToken(form)
+}
+
+func ROPC(username, password string) (TokenSet, error) {
+	form := url.Values{}
+	form.Set("client_id", ClientID())
+	form.Set("grant_type", "password")
+	form.Set("username", username)
+	form.Set("password", password)
+	form.Set("scope", Scope())
+	return requestTokenTenant(form, Authority()+"/organizations/oauth2/v2.0/token")
+}
+
+func requestTokenTenant(form url.Values, endpoint string) (TokenSet, error) {
+	req, err := http.NewRequest(http.MethodPost, endpoint, strings.NewReader(form.Encode()))
+	if err != nil {
+		return TokenSet{}, err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	resp, err := outbound.HTTPClient().Do(req)
+	if err != nil {
+		return TokenSet{}, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return TokenSet{}, err
+	}
+	var tr tokenResponse
+	if err := json.Unmarshal(body, &tr); err != nil {
+		return TokenSet{}, fmt.Errorf("decode token response: %w", err)
+	}
+	if tr.Error != "" {
+		return TokenSet{}, fmt.Errorf("ROPC %s: %s", tr.Error, tr.ErrorDesc)
+	}
+	if tr.AccessToken == "" {
+		return TokenSet{}, fmt.Errorf("ROPC HTTP %d: empty access token", resp.StatusCode)
+	}
+	set := TokenSet{
+		AccessToken:  tr.AccessToken,
+		RefreshToken: tr.RefreshToken,
+		IDToken:      tr.IDToken,
+		TokenType:    tr.TokenType,
+		Scope:        tr.Scope,
+		ExpiresIn:    tr.ExpiresIn,
+		ExpiresAt:    time.Now().Add(time.Duration(tr.ExpiresIn) * time.Second),
+	}
+	if claims, err := decodeJWTClaims(tr.AccessToken); err == nil {
+		set.Email = firstNonEmpty(claims["unique_name"], claims["upn"], claims["preferred_username"], claims["email"])
+		set.DisplayName = firstNonEmpty(claims["name"], set.Email)
+		set.HomeOID = firstNonEmpty(claims["oid"], claims["sub"])
+		set.TenantID = firstNonEmpty(claims["tid"], claims["tenant_id"])
+	}
+	return set, nil
+}
+
 func requestToken(form url.Values) (TokenSet, error) {
 	req, err := http.NewRequest(http.MethodPost, TokenEndpoint(), strings.NewReader(form.Encode()))
 	if err != nil {

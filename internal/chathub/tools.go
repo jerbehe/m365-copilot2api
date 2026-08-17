@@ -42,6 +42,9 @@ func clientPlugins(tools []Tool, mcpServerURL string) []any {
 		if json.Unmarshal(t.Function, &f) != nil || f.Name == "" {
 			continue
 		}
+		// CLI clients commonly declare web search as an OpenAI function.
+		// Route that declaration to M365's server-side BingWebSearch plugin so
+		// the service executes the search and returns the grounded answer.
 		if strings.EqualFold(f.Name, "web_search") {
 			plugins = append(plugins, webSearchPlugin)
 			continue

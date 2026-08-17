@@ -9,7 +9,6 @@ import (
 	"net/http"
 	"os"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -199,53 +198,6 @@ func contextFingerprint(messages []oaiMsg) string {
 	return hex.EncodeToString(h[:16])
 }
 
-func contextSimilarity(a, b []oaiMsg) float64 {
-	if len(a) == 0 || len(b) == 0 {
-		return 0
-	}
-	// 全历史相似：把双方所有消息文本拼起来做 Jaccard，比只比最后一条
-	// 更能代表整段上下文，避免两条短消息（如"继续"）就误判高度相似。
-	var ta, tb strings.Builder
-	for _, m := range a {
-		ta.WriteString(m.Role + ":" + contentToString(m.Content) + "\n")
-	}
-	for _, m := range b {
-		tb.WriteString(m.Role + ":" + contentToString(m.Content) + "\n")
-	}
-	return jaccardSimilarity(ta.String(), tb.String())
-}
-
-func jaccardSimilarity(a, b string) float64 {
-	setA := tokenize(a)
-	setB := tokenize(b)
-	if len(setA) == 0 && len(setB) == 0 {
-		return 1.0
-	}
-	if len(setA) == 0 || len(setB) == 0 {
-		return 0
-	}
-	intersection := 0
-	for k := range setA {
-		if setB[k] {
-			intersection++
-		}
-	}
-	union := len(setA) + len(setB) - intersection
-	if union == 0 {
-		return 0
-	}
-	return float64(intersection) / float64(union)
-}
-
-func tokenize(s string) map[string]bool {
-	tokens := map[string]bool{}
-	words := strings.Fields(strings.ToLower(s))
-	for _, w := range words {
-		tokens[w] = true
-	}
-	return tokens
-}
-
 func (sr *sessionResolver) Resolve(r *http.Request, body *oaiReq) ResolveResult {
 	sr.mu.Lock()
 	defer sr.mu.Unlock()
@@ -258,17 +210,17 @@ func (sr *sessionResolver) Resolve(r *http.Request, body *oaiReq) ResolveResult 
 	if explicitID != "" {
 		if sessID, ok := sr.byExplicit[explicitID]; ok {
 			if sess, ok := sr.sessions[sessID]; ok {
-			sess.LastUsedAt = time.Now().UTC()
-			sr.sessions[sessID] = sess
-			sr.persist.markDirty()
-			return ResolveResult{
-				SessionID:      sess.SessionID,
-				ConversationID: sess.ConversationID,
-				AccountID:      sess.AccountID,
-				MatchedBy:      "explicit",
-				IsNew:          false,
-				HistoryLen:     len(sess.ContextHistory),
-			}
+				sess.LastUsedAt = time.Now().UTC()
+				sr.sessions[sessID] = sess
+				sr.persist.markDirty()
+				return ResolveResult{
+					SessionID:      sess.SessionID,
+					ConversationID: sess.ConversationID,
+					AccountID:      sess.AccountID,
+					MatchedBy:      "explicit",
+					IsNew:          false,
+					HistoryLen:     len(sess.ContextHistory),
+				}
 			}
 		}
 		if sess, ok := sr.sessions[explicitID]; ok {
@@ -307,47 +259,69 @@ func (sr *sessionResolver) Resolve(r *http.Request, body *oaiReq) ResolveResult 
 
 	// 寮辩害鏉熷厹搴曪細鍐呭涓嶆瀯鎴愪弗鏍煎墠缂€锛屼絾涓庢煇涓巻鍙查珮搴︾浉浼硷紙濡傚鎴风
 	// 鏈湴鎴柇浜嗗巻鍙诧級锛屼粛澶嶇敤璇ヤ細璇濄€傛鏃跺閲忚竟鐣屾湭鐭ワ紝涓婂眰鍙戦€佸叏閲忋€?
-	threshold := 0.6
-	if v := os.Getenv("M365_CONTEXT_SIMILARITY"); v != "" {
-		if f, err := strconv.ParseFloat(v, 64); err == nil && f > 0 && f <= 1 {
-			threshold = f
-		}
-	}
-	bestMatchID := ""
-	bestSimilarity := 0.0
-	for id, sess := range sr.sessions {
-		if time.Since(sess.LastUsedAt) > sr.contextTTL {
-			continue
-		}
-		// 兜底同样受身份约束：只有同一 IP/UA 才可能复用。
-		if sess.IPFingerprint != ipFinger {
-			continue
-		}
-		// 兜底也需要至少两轮历史，单条短消息（如"继续"）不触发。
-		if len(sess.ContextHistory) < 2 {
-			continue
-		}
-		sim := contextSimilarity(sess.ContextHistory, body.Messages)
-		if sim > bestSimilarity {
-			bestSimilarity = sim
-			bestMatchID = id
-		}
-	}
-	if bestMatchID != "" && bestSimilarity >= threshold {
-		sess := sr.sessions[bestMatchID]
+	suffixID, suffixN := sr.matchSuffixLocked(ipFinger, body.Messages)
+	if suffixID != "" {
+		sess := sr.sessions[suffixID]
 		sess.LastUsedAt = time.Now().UTC()
-		sr.sessions[bestMatchID] = sess
+		sr.sessions[suffixID] = sess
 		sr.persist.markDirty()
 		return ResolveResult{
 			SessionID:      sess.SessionID,
 			ConversationID: sess.ConversationID,
 			AccountID:      sess.AccountID,
-			MatchedBy:      fmt.Sprintf("context_similar_%.2f", bestSimilarity),
+			MatchedBy:      fmt.Sprintf("context_suffix_%d", suffixN),
 			IsNew:          false,
+			HistoryLen:     suffixN,
 		}
 	}
 
 	return ResolveResult{IsNew: true}
+}
+
+func (sr *sessionResolver) matchSuffixLocked(ipFinger string, messages []oaiMsg) (string, int) {
+	if len(messages) < 2 {
+		return "", 0
+	}
+	type match struct {
+		id     string
+		n      int
+		recent time.Time
+	}
+	best := match{}
+	minSuffix := 2
+	for id, sess := range sr.sessions {
+		if time.Since(sess.LastUsedAt) > sr.contextTTL {
+			continue
+		}
+		if sess.IPFingerprint != ipFinger {
+			continue
+		}
+		hist := sess.ContextHistory
+		if len(hist) < minSuffix {
+			continue
+		}
+		n := suffixMatchLen(hist, messages)
+		if n >= minSuffix && (n > best.n || (n == best.n && sess.LastUsedAt.After(best.recent))) {
+			best = match{id: id, n: n, recent: sess.LastUsedAt}
+		}
+	}
+	return best.id, best.n
+}
+
+func suffixMatchLen(hist, msgs []oaiMsg) int {
+	maxN := len(hist)
+	if maxN > len(msgs) {
+		maxN = len(msgs)
+	}
+	n := 0
+	for i := 1; i <= maxN; i++ {
+		if messagesEqual(hist[len(hist)-i], msgs[len(msgs)-i]) {
+			n = i
+		} else {
+			break
+		}
+	}
+	return n
 }
 
 // matchContextLocked 浠庡叏閮ㄤ細璇濅腑鎵惧埌鍏?contextHistory 涓ユ牸浣滀负娑堟伅鍓嶇紑鐨?
@@ -357,8 +331,12 @@ func (sr *sessionResolver) matchContextLocked(ipFinger string, messages []oaiMsg
 	if len(messages) == 0 {
 		return "", 0
 	}
-	bestID := ""
-	bestN := 0
+	type match struct {
+		id     string
+		n      int
+		recent time.Time
+	}
+	best := match{}
 	for id, sess := range sr.sessions {
 		if time.Since(sess.LastUsedAt) > sr.contextTTL {
 			continue
@@ -367,14 +345,11 @@ func (sr *sessionResolver) matchContextLocked(ipFinger string, messages []oaiMsg
 			continue
 		}
 		n := contextPrefixLen(sess.ContextHistory, messages)
-		// 门槛：至少 2 条消息的前缀才算复用，避免不同用户以同一条
-		// 短消息（如"继续"）互相串会话。
-		if n > 1 && n > bestN {
-			bestN = n
-			bestID = id
+		if n >= 1 && (n > best.n || (n == best.n && sess.LastUsedAt.After(best.recent))) {
+			best = match{id: id, n: n, recent: sess.LastUsedAt}
 		}
 	}
-	return bestID, bestN
+	return best.id, best.n
 }
 
 // contextPrefixLen 杩斿洖 hist 鏄惁涓ユ牸鏄?msgs 鐨勫墠缂€銆俬ist 涓虹┖鎴栦笉鏄墠缂€
@@ -432,12 +407,26 @@ func toolCallEqual(x, y map[string]any) bool {
 	return xa == ya
 }
 
-func (sr *sessionResolver) Bind(sessionID, conversationID, accountID string, body *oaiReq, r *http.Request) {
+func (sr *sessionResolver) Bind(sessionID, conversationID, accountID string, body *oaiReq, args ...any) {
+	var assistantText string
+	var r *http.Request
+	for _, arg := range args {
+		switch value := arg.(type) {
+		case string:
+			assistantText = value
+		case *http.Request:
+			r = value
+		}
+	}
 	sr.mu.Lock()
 	defer sr.mu.Unlock()
 	sr.evictLocked()
 
 	now := time.Now().UTC()
+	history := cloneMessages(body.Messages)
+	if strings.TrimSpace(assistantText) != "" {
+		history = append(history, oaiMsg{Role: "assistant", Content: assistantText})
+	}
 	explicitID := r.Header.Get("X-M365-Session-Id")
 	if explicitID != "" && sessionID == "" {
 		sessionID = explicitID
@@ -451,8 +440,8 @@ func (sr *sessionResolver) Bind(sessionID, conversationID, accountID string, bod
 			sess.LastUsedAt = now
 			sess.UserField = body.User
 			sess.IPFingerprint = clientIPFingerprint(r)
-			sess.ContextFinger = contextFingerprint(body.Messages)
-			sess.ContextHistory = cloneMessages(body.Messages)
+			sess.ContextFinger = contextFingerprint(history)
+			sess.ContextHistory = history
 			sr.sessions[sessionID] = sess
 			sr.reindexLocked(sess)
 			sr.persist.markDirty()
@@ -466,8 +455,8 @@ func (sr *sessionResolver) Bind(sessionID, conversationID, accountID string, bod
 				sess.AccountID = accountID
 				sess.UserField = body.User
 				sess.IPFingerprint = clientIPFingerprint(r)
-				sess.ContextFinger = contextFingerprint(body.Messages)
-				sess.ContextHistory = cloneMessages(body.Messages)
+				sess.ContextFinger = contextFingerprint(history)
+				sess.ContextHistory = history
 				sr.sessions[sid] = sess
 				sr.reindexLocked(sess)
 				sr.persist.markDirty()
@@ -485,8 +474,8 @@ func (sr *sessionResolver) Bind(sessionID, conversationID, accountID string, bod
 		LastUsedAt:     now,
 		IPFingerprint:  clientIPFingerprint(r),
 		UserField:      body.User,
-		ContextFinger:  contextFingerprint(body.Messages),
-		ContextHistory: cloneMessages(body.Messages),
+		ContextFinger:  contextFingerprint(history),
+		ContextHistory: history,
 	}
 
 	sr.reindexLocked(sess)
@@ -498,6 +487,18 @@ func (sr *sessionResolver) GetSession(sessionID string) (sessionBinding, bool) {
 	defer sr.mu.Unlock()
 	s, ok := sr.sessions[sessionID]
 	return s, ok
+}
+
+func (sr *sessionResolver) GetConversation(conversationID string) (sessionBinding, bool) {
+	sr.mu.Lock()
+	defer sr.mu.Unlock()
+	for _, session := range sr.sessions {
+		if session.ConversationID == conversationID {
+			session.ContextHistory = cloneMessages(session.ContextHistory)
+			return session, true
+		}
+	}
+	return sessionBinding{}, false
 }
 
 func (sr *sessionResolver) ListSessions() []sessionBinding {
@@ -566,6 +567,9 @@ func (sr *sessionResolver) UnbindByConversation(conversationID string) int {
 }
 
 func cloneMessages(msgs []oaiMsg) []oaiMsg {
+	if len(msgs) > 20 {
+		msgs = msgs[len(msgs)-20:]
+	}
 	out := make([]oaiMsg, len(msgs))
 	copy(out, msgs)
 	return out

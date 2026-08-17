@@ -76,7 +76,7 @@ func parseModelToolDecision(text string, tools []map[string]any, choice any) ([]
 				var args map[string]any
 				if json.Unmarshal([]byte(argsStr), &args) == nil && toolChoiceAllows(choice, name) {
 					fn := toolFunction(name, tools)
-					if fn != nil {
+					if fn != nil && schemaValid(args, fn) == nil {
 						b, _ := json.Marshal(args)
 						return []detectedToolCall{{ID: callID(name, string(b), 0), Type: toolType(name, tools), Name: name, Arguments: b}}, true
 					}

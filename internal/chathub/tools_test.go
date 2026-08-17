@@ -7,17 +7,21 @@ import (
 )
 
 func TestClientPluginsWebSearchBuiltIn(t *testing.T) {
-	// web_search must be declared exactly like the web UI toggle does:
+	// Both the dedicated web_search type and the function form used by CLI
+	// clients must enable M365's server-side search:
 	// {"Id":"BingWebSearch","Source":"BuiltIn"}, so Copilot searches
-	// server-side instead of surfacing an unexecutable client tool call.
+	// server-side.
 	byType := Tool{Type: "web_search", Function: nil}
-	byName := Tool{Type: "function", Function: json.RawMessage(`{"name":"web_search","description":"search","parameters":null}`)}
+	byFunction := Tool{Type: "function", Function: json.RawMessage(`{"name":"web_search","description":"search the web","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}}`)}
 	for _, tc := range []struct {
-		name  string
-		tools []Tool
-	}{{"by type", []Tool{byType}}, {"by name", []Tool{byName}}} {
+		name string
+		tool Tool
+	}{
+		{"dedicated type", byType},
+		{"CLI function", byFunction},
+	} {
 		t.Run(tc.name, func(t *testing.T) {
-			plugins := clientPlugins(tc.tools, "")
+			plugins := clientPlugins([]Tool{tc.tool}, "")
 			if len(plugins) != 1 {
 				t.Fatalf("plugins = %#v", plugins)
 			}
@@ -43,12 +47,12 @@ func TestClientPluginsOtherToolsStillClient(t *testing.T) {
 
 func TestToolProtocolPromptDeclaresWebSearch(t *testing.T) {
 	ws := Tool{Type: "web_search", Function: nil}
-	prompt := toolProtocolPrompt("Find the latest price.", []Tool{ws}, "auto")
+	prompt := toolProtocolPrompt("Find the latest price.", []Tool{ws}, "auto", false)
 	if !strings.Contains(prompt, "web_search") || !strings.Contains(prompt, `"query"`) {
 		t.Fatalf("web_search declaration missing from prompt:\n%s", prompt)
 	}
 	fn := Tool{Type: "function", Function: json.RawMessage(`{"name":"get_weather","description":"weather","parameters":{"type":"object"}}`)}
-	prompt = toolProtocolPrompt("What is the weather?", []Tool{fn}, "auto")
+	prompt = toolProtocolPrompt("What is the weather?", []Tool{fn}, "auto", false)
 	if !strings.Contains(prompt, "get_weather") || strings.Contains(prompt, "web_search") {
 		t.Fatalf("function tool rendering broken:\n%s", prompt)
 	}

@@ -1082,7 +1082,7 @@ async function startPKCE(){
     $('callbackInput').dataset.state=d.state;
     const popup=window.open(d.url,'pkce','width=600,height=800');
     if(!popup){$('authStatus').innerHTML='<div class="highlight-box warning"><div class="highlight-box-title"><i data-lucide="alert-circle" style="width:14px;height:14px"></i>Popup blocked by browser</div><p>Please allow popups for this site, then click "Start authorization" again.</p></div>';lucide.createIcons();return;}
-    $('authStatus').innerHTML='<div class="highlight-box"><div class="highlight-box-title"><i data-lucide="info" style="width:14px;height:14px"></i>Authorization page opened in a new window</div><p>Complete the sign-in in the popup. After signing in, the popup will show a blank or error page — this is normal. Copy the <b>full URL from the popup's address bar</b> and paste it into the Callback URL field below.</p></div>';
+    $('authStatus').innerHTML='<div class="highlight-box"><div class="highlight-box-title"><i data-lucide="info" style="width:14px;height:14px"></i>Authorization page opened in a new window</div><p>Complete the sign-in in the popup. After signing in, the popup will show a blank or error page — this is normal. Copy the <b>full URL from the popup\'s address bar</b> and paste it into the Callback URL field below.</p></div>';
     $('callbackInput').focus();
     $('callbackInput').placeholder='Paste the full callback URL from the popup address bar…';
     if(pkceTimer)clearInterval(pkceTimer);

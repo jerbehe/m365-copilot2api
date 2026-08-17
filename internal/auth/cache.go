@@ -5,22 +5,24 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
 
 type AccountToken struct {
-	ID           string    `json:"id"`
-	Email        string    `json:"email"`
-	DisplayName  string    `json:"displayName,omitempty"`
-	Status       string    `json:"status"`
-	AccessToken  string    `json:"accessToken"`
-	RefreshToken string    `json:"refreshToken,omitempty"`
-	ExpiresAt    time.Time `json:"expiresAt"`
-	UpdatedAt    time.Time `json:"updatedAt"`
-	OID          string    `json:"oid,omitempty"`
-	TID          string    `json:"tid,omitempty"`
-	ClientID     string    `json:"clientId,omitempty"`
+	ID               string    `json:"id"`
+	Email            string    `json:"email"`
+	DisplayName      string    `json:"displayName,omitempty"`
+	Status           string    `json:"status"`
+	ScheduleDisabled bool      `json:"scheduleDisabled,omitempty"`
+	AccessToken      string    `json:"accessToken"`
+	RefreshToken     string    `json:"refreshToken,omitempty"`
+	ExpiresAt        time.Time `json:"expiresAt"`
+	UpdatedAt        time.Time `json:"updatedAt"`
+	OID              string    `json:"oid,omitempty"`
+	TID              string    `json:"tid,omitempty"`
+	ClientID         string    `json:"clientId,omitempty"`
 }
 
 type Cache struct {
@@ -126,6 +128,47 @@ func (s *Store) List() []AccountToken {
 	return out
 }
 
+func (s *Store) SetScheduleEnabled(id string, enabled bool) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := range s.data.Accounts {
+		if s.data.Accounts[i].ID == id {
+			s.data.Accounts[i].ScheduleDisabled = !enabled
+			s.data.Accounts[i].UpdatedAt = time.Now()
+			return s.saveLocked()
+		}
+	}
+	return errors.New("account not found")
+}
+
+func (s *Store) ScheduleEnabled(id string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, account := range s.data.Accounts {
+		if account.ID == id {
+			return !account.ScheduleDisabled
+		}
+	}
+	return false
+}
+
+func (s *Store) UpdateRefreshToken(id, refreshToken string) error {
+	refreshToken = strings.TrimSpace(refreshToken)
+	if refreshToken == "" {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := range s.data.Accounts {
+		if s.data.Accounts[i].ID == id {
+			s.data.Accounts[i].RefreshToken = refreshToken
+			s.data.Accounts[i].UpdatedAt = time.Now()
+			return s.saveLocked()
+		}
+	}
+	return errors.New("account not found")
+}
+
 func (s *Store) Upsert(tok TokenSet) (AccountToken, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -161,6 +204,7 @@ func (s *Store) Upsert(tok TokenSet) (AccountToken, error) {
 			if acc.OID == "" {
 				acc.OID = existing.OID
 			}
+			acc.ScheduleDisabled = existing.ScheduleDisabled
 			s.data.Accounts[i] = acc
 			found = true
 			break
@@ -296,4 +340,37 @@ func (s *Store) refreshInflight(acc AccountToken) (AccountToken, error) {
 
 func fmtExpired() error {
 	return errors.New("token_expired: refresh token missing or expired")
+}
+
+func (s *Store) RefreshAllExpired() []TokenRefreshResult {
+	s.mu.Lock()
+	candidates := make([]AccountToken, 0, len(s.data.Accounts))
+	for _, a := range s.data.Accounts {
+		if time.Now().After(a.ExpiresAt.Add(-30*time.Second)) && a.RefreshToken != "" {
+			candidates = append(candidates, a)
+		}
+	}
+	s.mu.Unlock()
+	var results []TokenRefreshResult
+	for _, a := range candidates {
+		acc, err := s.EnsureValid(a.ID)
+		r := TokenRefreshResult{ID: a.ID, Email: a.Email}
+		if err != nil {
+			r.Success = false
+			r.Error = err.Error()
+		} else {
+			r.Success = true
+			r.ExpiresAt = acc.ExpiresAt
+		}
+		results = append(results, r)
+	}
+	return results
+}
+
+type TokenRefreshResult struct {
+	ID        string    `json:"id"`
+	Email     string    `json:"email"`
+	Success   bool      `json:"success"`
+	Error     string    `json:"error,omitempty"`
+	ExpiresAt time.Time `json:"expires_at,omitempty"`
 }

@@ -42,6 +42,9 @@ type Server struct {
 	mu                  sync.Mutex
 	tokens              *auth.Store
 	accountPool         *accountHealth
+	accountConcurrency  *accountConcurrency
+	convCache           *conversationCache
+	generatedImages     map[string]generatedImage
 	pkce                map[string]pendingPKCE
 	chat                *chathub.Client
 	sessions            *sessionStore
@@ -80,9 +83,12 @@ func New() (*Server, error) {
 		}
 	}
 	return &Server{
-		tokens:      store,
-		accountPool: newAccountHealth(),
-		pkce:        map[string]pendingPKCE{},
+		tokens:             store,
+		accountPool:        newAccountHealth(),
+		accountConcurrency: newAccountConcurrency(),
+		convCache:          newConversationCache(),
+		generatedImages:    map[string]generatedImage{},
+		pkce:               map[string]pendingPKCE{},
 		chat: func() *chathub.Client {
 			c := chathub.NewClient()
 			c.Trace = func(meta map[string]any) { fmt.Printf("[multimodal-trace] %s\\n", mustJSON(meta)) }
@@ -141,6 +147,7 @@ func (s *Server) Routes() http.Handler {
 	m.HandleFunc("/api/version", s.version)
 	m.HandleFunc("/api/update", s.update)
 	m.HandleFunc("/api/accounts", s.accounts)
+	m.HandleFunc("/api/accounts/schedule", s.scheduleAccount)
 	m.HandleFunc("/api/accounts/refresh", s.refreshAccount)
 	m.HandleFunc("/api/accounts/delete", s.deleteAccount)
 	m.HandleFunc("/api/auth/start", s.startPKCE)
@@ -420,22 +427,35 @@ func (s *Server) accounts(w http.ResponseWriter, r *http.Request) {
 	}
 	list := s.tokens.List()
 	type view struct {
-		ID          string    `json:"id"`
-		Email       string    `json:"email"`
-		DisplayName string    `json:"displayName,omitempty"`
-		Status      string    `json:"status"`
-		OID         string    `json:"oid,omitempty"`
-		TID         string    `json:"tid,omitempty"`
-		ExpiresAt   time.Time `json:"expiresAt,omitempty"`
-		UpdatedAt   time.Time `json:"updatedAt,omitempty"`
+		ID             string     `json:"id"`
+		Email          string     `json:"email"`
+		DisplayName    string     `json:"displayName,omitempty"`
+		Status         string     `json:"status"`
+		OID            string     `json:"oid,omitempty"`
+		TID            string     `json:"tid,omitempty"`
+		ExpiresAt      time.Time  `json:"expiresAt,omitempty"`
+		UpdatedAt      time.Time  `json:"updatedAt,omitempty"`
+		ScheduleEnabled bool      `json:"scheduleEnabled"`
+		CallCount      uint64     `json:"callCount"`
+		CooldownUntil  *time.Time `json:"cooldownUntil"`
 	}
 	out := make([]view, 0, len(list))
 	for _, a := range list {
-		out = append(out, view{
+		v := view{
 			ID: a.ID, Email: a.Email, DisplayName: a.DisplayName,
 			Status: a.Status, OID: a.OID, TID: a.TID,
 			ExpiresAt: a.ExpiresAt, UpdatedAt: a.UpdatedAt,
-		})
+			ScheduleEnabled: s.tokens.ScheduleEnabled(a.ID),
+			CallCount: s.accountPool.CallCount(a.ID),
+		}
+		if until, ok := s.accountPool.CooldownUntil(a.ID); ok {
+			if time.Now().Before(until) {
+				u := until
+				v.CooldownUntil = &u
+				v.Status = "cooldown"
+			}
+		}
+		out = append(out, v)
 	}
 	jsonOut(w, map[string]any{"accounts": out})
 }
@@ -637,14 +657,14 @@ func (s *Server) resolveAccount(accountID string) (auth.AccountToken, error) {
 		accountID = acc.ID
 		// Round-robin may land on a cooling-down or auth-failed account;
 		// walk the pool for the next healthy one without infinite loops.
-		for i := 0; !s.accountPool.Available(accountID) && i < maxAccountProbe; i++ {
+		for i := 0; !s.accountAvailable(accountID) && i < maxAccountProbe; i++ {
 			acc, ok = s.tokens.Next()
 			if !ok {
 				break
 			}
 			accountID = acc.ID
 		}
-		if !s.accountPool.Available(accountID) {
+		if !s.accountAvailable(accountID) {
 			return auth.AccountToken{}, fmt.Errorf("all accounts are cooling down or failing auth; try again later")
 		}
 	}
@@ -664,7 +684,7 @@ func (s *Server) nextHealthyAccount(avoidID string) (auth.AccountToken, error) {
 		if avoidID != "" && acc.ID == avoidID {
 			continue
 		}
-		if !s.accountPool.Available(acc.ID) {
+		if !s.accountAvailable(acc.ID) {
 			continue
 		}
 		return s.tokens.EnsureValid(acc.ID)
@@ -929,11 +949,12 @@ func (s *Server) openaiModels(w http.ResponseWriter, r *http.Request) {
 }
 
 type oaiMsg struct {
-	Role       string           `json:"role"`
-	Content    any              `json:"content"`
-	Name       string           `json:"name,omitempty"`
-	ToolCallID string           `json:"tool_call_id,omitempty"`
-	ToolCalls  []map[string]any `json:"tool_calls,omitempty"`
+	Role             string           `json:"role"`
+	Content          any              `json:"content"`
+	ReasoningContent string           `json:"reasoning_content,omitempty"`
+	Name             string           `json:"name,omitempty"`
+	ToolCallID       string           `json:"tool_call_id,omitempty"`
+	ToolCalls        []map[string]any `json:"tool_calls,omitempty"`
 }
 
 type oaiReq struct {
@@ -1744,7 +1765,7 @@ func (s *Server) bindConversation(acc auth.AccountToken, body *oaiReq, r *http.R
 	if res.ConversationID == "" {
 		return
 	}
-	s.sessionResolver.Bind("", res.ConversationID, acc.ID, body, r)
+	s.sessionResolver.Bind("", res.ConversationID, acc.ID, body, prompt, r)
 	s.conversationManager.Record(res.ConversationID, acc.ID, prompt)
 	if s.conversationManager.ShouldCleanup() {
 		if cleaned := s.conversationManager.Cleanup(); len(cleaned) > 0 {

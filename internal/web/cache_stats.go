@@ -1,6 +1,9 @@
 package web
 
 import (
+	"encoding/json"
+	"os"
+	"path/filepath"
 	"sync"
 	"time"
 )
@@ -18,11 +21,12 @@ type CacheStats struct {
 	HitRate        float64       `json:"hit_rate"`
 	SavingsPercent float64       `json:"savings_percent"`
 
-	// 按 API Key 统计
 	KeyStats map[string]*KeyStat `json:"key_stats"`
+
+	path    string
+	persist *persistStore
 }
 
-// statsSnapshot 是无锁深拷贝快照，避免 GetStats 复制锁值。
 type statsSnapshot struct {
 	TotalRequests  int64         `json:"total_requests"`
 	CacheHits      int64         `json:"cache_hits"`
@@ -47,8 +51,25 @@ type KeyStat struct {
 	LastUsed      time.Time `json:"last_used"`
 }
 
-var cacheStats = &CacheStats{
-	KeyStats: make(map[string]*KeyStat),
+var cacheStats = openCacheStats()
+
+func openCacheStats() *CacheStats {
+	p := statsPath()
+	s := &CacheStats{KeyStats: make(map[string]*KeyStat), path: p}
+	b, err := os.ReadFile(p)
+	if err == nil {
+		json.Unmarshal(b, s)
+		if s.KeyStats == nil {
+			s.KeyStats = make(map[string]*KeyStat)
+		}
+	}
+	s.persist = &persistStore{flush: s.flush}
+	return s
+}
+
+func statsPath() string {
+	h, _ := os.UserHomeDir()
+	return filepath.Join(h, ".config", "m365-copilot2api", "stats.json")
 }
 
 func (s *CacheStats) RecordRequest(apiKey string, hit bool, tokensSent, tokensSaved int64, activeSessions int) {
@@ -73,7 +94,6 @@ func (s *CacheStats) RecordRequest(apiKey string, hit bool, tokensSent, tokensSa
 		s.SavingsPercent = float64(s.TokensSaved) / float64(s.TokensSent+s.TokensSaved) * 100
 	}
 
-	// 按 API Key 统计
 	ks, ok := s.KeyStats[apiKey]
 	if !ok {
 		ks = &KeyStat{APIKey: apiKey}
@@ -91,6 +111,7 @@ func (s *CacheStats) RecordRequest(apiKey string, hit bool, tokensSent, tokensSa
 	if ks.TotalRequests > 0 {
 		ks.HitRate = float64(ks.CacheHits) / float64(ks.TotalRequests) * 100
 	}
+	s.persist.markDirty()
 }
 
 func (s *CacheStats) GetStats() statsSnapshot {
@@ -126,6 +147,20 @@ func (s *CacheStats) Reset() {
 	s.HitRate = 0
 	s.SavingsPercent = 0
 	s.KeyStats = make(map[string]*KeyStat)
+	s.persist.markDirty()
+}
+
+func (s *CacheStats) flush() error {
+	s.mu.Lock()
+	b, err := json.MarshalIndent(s, "", "  ")
+	s.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(s.path), 0700); err != nil {
+		return err
+	}
+	return writeFileAtomic(s.path, b, 0600)
 }
 
 func EstimateTokens(text string) int64 {

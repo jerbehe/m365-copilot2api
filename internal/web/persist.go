@@ -10,10 +10,11 @@ import (
 // persistStore 延迟磁盘持久化：内存变更只标记 dirty，由后台循环合并写盘，
 // 避免高频路径在锁内做整文件写入。
 type persistStore struct {
-	writeMu sync.Mutex
-	dirtyMu sync.Mutex
-	dirty   bool
-	flush   func() error // 自行管理数据快照锁，锁外写盘
+	writeMu     sync.Mutex
+	dirtyMu     sync.Mutex
+	dirty       bool
+	flush       func() error
+	registered  bool
 }
 
 func (p *persistStore) markDirty() {
@@ -66,7 +67,10 @@ var (
 
 func ensurePersistLoop(p *persistStore) {
 	persistMu.Lock()
-	persistList = append(persistList, p)
+	if !p.registered {
+		p.registered = true
+		persistList = append(persistList, p)
+	}
 	persistMu.Unlock()
 	persistOnce.Do(func() {
 		persistStop = make(chan struct{})

@@ -605,7 +605,8 @@ func (c *Client) uploadAttachments(ctx context.Context, acc Account, conversatio
 }
 
 func chatPayload(text, sessionID, conversationID, requestID, tone string, firstTurn bool, attachments []Attachment, tools []Tool, toolChoice any, mcpServerURL string) string {
-	text = toolProtocolPrompt(text, tools, toolChoice)
+	plugins := clientPlugins(tools, mcpServerURL)
+	text = toolProtocolPrompt(text, tools, toolChoice, len(plugins) > 0)
 	message := map[string]any{
 		"author":                "user",
 		"attachments":           attachments,
@@ -716,7 +717,7 @@ func chatPayload(text, sessionID, conversationID, requestID, tone string, firstT
 				"streamingMode": "ConciseWithPadding",
 				"message":       message,
 
-				"plugins":    clientPlugins(tools, mcpServerURL),
+				"plugins":    plugins,
 				"toolChoice": toolChoice,
 			},
 		},

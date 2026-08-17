@@ -4,9 +4,16 @@ package web
 
 import (
 	"fmt"
+	"io"
+	"log"
+	"net/http"
 	"os"
+	"regexp"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 )
 
 type modelLimits struct{ ContextWindow, MaxInputTokens, MaxOutputTokens int }
@@ -62,12 +69,13 @@ var gatewayModels = []modelSpec{
 	{ID: "gpt-5.5", Owner: "microsoft-365", Tools: true},
 	{ID: "gpt-5.5-reasoning", Owner: "microsoft-365", Tools: true},
 	{ID: "gpt-5.6-reasoning", Owner: "microsoft-365", Tools: true},
+	{ID: "gpt-image-2", Owner: "microsoft-365", DisplayName: "GPT Image 2"},
 	{ID: "claude-sonnet", Owner: "anthropic-via-microsoft-365", Tools: true},
 	{ID: "claude-sonnet-reasoning", Owner: "anthropic-via-microsoft-365", Tools: true},
 }
 
 func validUpstreamTone(tone string) bool {
-	for _, known := range knownUpstreamTones() {
+	for _, known := range liveUpstreamTones() {
 		if tone == known {
 			return true
 		}
@@ -77,6 +85,74 @@ func validUpstreamTone(tone string) bool {
 
 func knownUpstreamTones() []string {
 	return []string{"Gpt_5_2_Chat", "Gpt_5_2_Reasoning", "Gpt_5_3_Chat", "Gpt_5_3_Reasoning", "Gpt_5_4_Chat", "Gpt_5_4_Reasoning", "Gpt_5_5_Chat", "Gpt_5_5_Reasoning", "Gpt_5_6_Reasoning", "Claude_Sonnet", "Claude_Sonnet_Reasoning"}
+}
+
+var (
+	dynamicTones []string
+	dynamicMu    sync.RWMutex
+	dynamicAt    time.Time
+)
+
+func liveUpstreamTones() []string {
+	dynamicMu.RLock()
+	if dynamicAt.IsZero() || time.Since(dynamicAt) > 24*time.Hour {
+		dynamicMu.RUnlock()
+		go syncUpstreamTones()
+		dynamicMu.RLock()
+	}
+	t := dynamicTones
+	dynamicMu.RUnlock()
+	if len(t) > 0 {
+		return t
+	}
+	return knownUpstreamTones()
+}
+
+func syncUpstreamTones() {
+	tones := fetchUpstreamTones()
+	if len(tones) == 0 {
+		return
+	}
+	dynamicMu.Lock()
+	dynamicTones = tones
+	dynamicAt = time.Now()
+	dynamicMu.Unlock()
+	log.Printf("synced %d upstream tones from CDN bundle", len(tones))
+}
+
+func fetchUpstreamTones() []string {
+	client := &http.Client{Timeout: 30 * time.Second}
+	pageURL := "https://m365.cloud.microsoft/"
+	resp, err := client.Get(pageURL)
+	if err != nil {
+		return nil
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	re := regexp.MustCompile(`main\.[a-f0-9]{8}\.js`)
+	m := re.FindString(string(body))
+	if m == "" {
+		return nil
+	}
+	bundleURL := "https://res.public.onecdn.static.microsoft/midgard/versionless-v2/" + m
+	resp2, err := client.Get(bundleURL)
+	if err != nil {
+		return nil
+	}
+	bundle, _ := io.ReadAll(resp2.Body)
+	resp2.Body.Close()
+	toneRe := regexp.MustCompile(`(?:Gpt_[0-9]_[0-9]_[A-Za-z_]+|Claude_[A-Za-z0-9_]+|Magic)`)
+	matches := toneRe.FindAllString(string(bundle), -1)
+	seen := map[string]bool{}
+	for _, t := range matches {
+		seen[t] = true
+	}
+	result := make([]string, 0, len(seen))
+	for t := range seen {
+		result = append(result, t)
+	}
+	sort.Strings(result)
+	return result
 }
 
 func configuredModelMapping(model string, mappings []modelMapping) (modelMapping, bool) {
@@ -209,9 +285,9 @@ func modelCatalog() []map[string]any {
 			defaultReasoningLevel = "medium"
 		}
 		out = append(out, map[string]any{
-			"id": m.ID, "slug": m.ID, "display_name": displayName, "description": "Microsoft 365 gateway model route.",
+			"id": m.ID, "slug": m.ID, "display_name": displayName, "description": "Public model endpoint.",
 			"base_instructions": gatewayCodexBaseInstructions, "model_messages": codexModelMessages(),
-			"default_reasoning_level": defaultReasoningLevel, "object": "model", "owned_by": m.Owner,
+			"default_reasoning_level": defaultReasoningLevel, "object": "model", "owned_by": "gateway",
 			"shell_type": "shell_command", "visibility": "list", "supported_in_api": true, "priority": 1,
 			"additional_speed_tiers": []string{}, "service_tiers": []any{},
 			"availability_nux": nil, "upgrade": nil, "include_skills_usage_instructions": false,

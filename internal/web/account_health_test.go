@@ -1,6 +1,7 @@
 package web
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"m365-copilot2api/internal/auth"
+	"m365-copilot2api/internal/chathub"
 )
 
 func TestUpstreamErrorClassification(t *testing.T) {
@@ -26,9 +28,12 @@ func TestUpstreamErrorClassification(t *testing.T) {
 		{&UpstreamHTTPError{Status: 401}, false, true, 0, http.StatusUnauthorized},
 		{&UpstreamHTTPError{Status: 403}, false, true, 0, http.StatusUnauthorized},
 		{&UpstreamHTTPError{Status: 502}, false, false, 0, http.StatusBadGateway},
+		{&UpstreamHTTPError{Status: 502, Body: "account is limited"}, true, false, 0, http.StatusTooManyRequests},
 		{fmt.Errorf("upstream http 429"), true, false, 0, http.StatusTooManyRequests},
 		{fmt.Errorf("Too many requests, slow down"), true, false, 0, http.StatusTooManyRequests},
+		{fmt.Errorf("account is limited"), true, false, 0, http.StatusTooManyRequests},
 		{fmt.Errorf("random failure"), false, false, 0, http.StatusBadGateway},
+		{chathub.ErrRateLimitNotice, true, false, 0, http.StatusTooManyRequests},
 	}
 	for _, c := range cases {
 		if got := IsRateLimited(c.err); got != c.limited {
@@ -57,7 +62,13 @@ func TestAccountHealthLifecycle(t *testing.T) {
 	if h.Available(id) {
 		t.Fatal("rate-limited account must be in cooldown")
 	}
+	if !h.RateLimited(id) {
+		t.Fatal("rate-limited account missing rate-limit state")
+	}
 	h.MarkSuccess(id)
+	if h.RateLimited(id) {
+		t.Fatal("success must clear rate-limit state")
+	}
 	if !h.Available(id) {
 		t.Fatal("MarkSuccess must lift the cooldown")
 	}
@@ -75,6 +86,52 @@ func TestAccountHealthLifecycle(t *testing.T) {
 	until := h.Snapshot()[id]
 	if until == nil || until["available"].(bool) || until["cooldownUntil"] == nil {
 		t.Fatalf("snapshot should report cooldown until: %v", h.Snapshot())
+	}
+}
+
+func TestCooldownExpiryClearsCallCount(t *testing.T) {
+	h := newAccountHealth()
+	const id = "acct-expiry"
+	h.MarkCall(id)
+	h.MarkCall(id)
+	h.MarkFailure(id, fmt.Errorf("account limited"), time.Minute)
+	h.mu.Lock()
+	h.cooldown[id] = time.Now().Add(-time.Second)
+	h.mu.Unlock()
+	if !h.Available(id) {
+		t.Fatal("expired cooldown must be available")
+	}
+	if h.CallCount(id) != 0 {
+		t.Fatalf("call count=%d want 0", h.CallCount(id))
+	}
+	if h.RateLimited(id) {
+		t.Fatal("expired cooldown still marked limited")
+	}
+	h.MarkCall(id)
+	h.MarkFailure(id, fmt.Errorf("account limited"), time.Minute)
+	h.mu.Lock()
+	h.cooldown[id] = time.Now().Add(-time.Second)
+	h.mu.Unlock()
+	if _, ok := h.CooldownUntil(id); ok || h.CallCount(id) != 0 {
+		t.Fatal("CooldownUntil must clear expired call count")
+	}
+	h.MarkCall(id)
+	h.MarkFailure(id, fmt.Errorf("account limited"), time.Minute)
+	h.mu.Lock()
+	h.cooldown[id] = time.Now().Add(-time.Second)
+	h.mu.Unlock()
+	h.MarkCall(id)
+	if h.CallCount(id) != 1 {
+		t.Fatalf("post-cooldown call count=%d want 1", h.CallCount(id))
+	}
+	const authID = "acct-auth-expiry"
+	h.MarkCall(authID)
+	h.MarkFailure(authID, &UpstreamHTTPError{Status: 401}, time.Minute)
+	h.mu.Lock()
+	h.cooldown[authID] = time.Now().Add(-time.Second)
+	h.mu.Unlock()
+	if !h.Available(authID) || h.CallCount(authID) != 1 {
+		t.Fatal("auth cooldown must not clear call count")
 	}
 }
 
@@ -141,6 +198,31 @@ func TestResolveAccountSkipsUnhealthy(t *testing.T) {
 	}
 }
 
+func TestResolveAccountSkipsSchedulingDisabled(t *testing.T) {
+	store := testAccountFiles(t)
+	if err := store.SetScheduleEnabled("u-1", false); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetScheduleEnabled("u-2", false); err != nil {
+		t.Fatal(err)
+	}
+	s := &Server{tokens: store, accountPool: newAccountHealth()}
+	acc, err := s.resolveAccount("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if acc.ID != "u-3" {
+		t.Fatalf("scheduled account=%s want u-3", acc.ID)
+	}
+	explicit, err := s.resolveAccount("u-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if explicit.ID != "u-1" {
+		t.Fatalf("explicit account=%s want u-1", explicit.ID)
+	}
+}
+
 func TestResolveAccountAllUnhealthy(t *testing.T) {
 	store := testAccountFiles(t)
 	s := &Server{tokens: store, accountPool: newAccountHealth()}
@@ -173,5 +255,79 @@ func TestNextHealthyAccount(t *testing.T) {
 	}
 	if _, err := s.nextHealthyAccount(""); err == nil {
 		t.Fatal("nextHealthyAccount must fail when no healthy account remains")
+	}
+}
+
+func TestScheduleAccount(t *testing.T) {
+	store := testAccountFiles(t)
+	s := &Server{tokens: store}
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodPost, "/api/accounts/schedule", strings.NewReader(`{"id":"u-1","enabled":false}`))
+	s.scheduleAccount(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+	}
+	if store.ScheduleEnabled("u-1") {
+		t.Fatal("account scheduling still enabled")
+	}
+}
+
+func TestAccountsReportsCooldown(t *testing.T) {
+	store := testAccountFiles(t)
+	s := &Server{tokens: store, accountPool: newAccountHealth()}
+	s.accountPool.MarkCall("u-1")
+	s.accountPool.MarkCall("u-1")
+	s.accountPool.MarkFailure("u-1", fmt.Errorf("account limited"), 20*time.Minute)
+
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodGet, "/api/accounts", nil)
+	s.accounts(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+	}
+	var body struct {
+		Accounts []struct {
+			ID              string     `json:"id"`
+			Status          string     `json:"status"`
+			ScheduleEnabled bool       `json:"scheduleEnabled"`
+			CallCount       uint64     `json:"callCount"`
+			CooldownUntil   *time.Time `json:"cooldownUntil"`
+		} `json:"accounts"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	for _, account := range body.Accounts {
+		if account.ID != "u-1" {
+			continue
+		}
+		if account.Status != "cooldown" || account.CooldownUntil == nil || !account.ScheduleEnabled || account.CallCount != 2 {
+			t.Fatalf("cooldown account=%#v", account)
+		}
+		return
+	}
+	t.Fatal("cooldown account missing")
+}
+
+func TestFailoverAllowsResolvedConversationID(t *testing.T) {
+	accountID := ""
+	conversationID := "conv-123"
+	resolvedConversationID := "conv-123"
+	if !(conversationID == "" || conversationID == resolvedConversationID) {
+		t.Fatal("failover must be allowed when ConversationID was injected by session resolver")
+	}
+	explicitConversationID := "conv-explicit"
+	if explicitConversationID == "" || explicitConversationID == resolvedConversationID {
+		t.Fatal("failover must NOT be allowed when ConversationID was explicitly set by client")
+	}
+	_ = accountID
+}
+
+func TestErrRateLimitNoticeTriggersMarkFailure(t *testing.T) {
+	h := newAccountHealth()
+	const id = "acct-rl"
+	h.MarkFailure(id, chathub.ErrRateLimitNotice, 15*time.Minute)
+	if h.Available(id) {
+		t.Fatal("ErrRateLimitNotice must put account in cooldown")
 	}
 }

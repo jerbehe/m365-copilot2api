@@ -30,6 +30,7 @@ func writeAnthropicResult(w http.ResponseWriter, model string, stream bool, src 
 func writeAnthropicResultUsage(w http.ResponseWriter, model string, stream bool, src map[string]any, estimate responsesUsageEstimate) {
 	id := "msg_" + uuid.NewString()
 	msg, finish := openAIChoice(src)
+	sanitizePublicAssistantMessage(msg)
 	inputTokens, outputTokens := 0, 0
 	usageSource := "unavailable_from_chathub"
 	if estimate.Values != nil {

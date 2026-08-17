@@ -17,6 +17,7 @@ func TestResolveContentKeyedSameIdentity(t *testing.T) {
 	// 首次请求绑定云端对话，同一 IP/UA 但不同 user 账户。
 	sr.Bind("", "conv-shared", "acc1",
 		&oaiReq{User: "alice", Messages: []oaiMsg{{Role: "user", Content: "hello"}, {Role: "assistant", Content: "你好"}}},
+		"",
 		resolverTestRequest("203.0.113.10", "client-a", "alice"))
 
 	// 续接请求来自同一 IP/UA（换 user 仍可命中，说明不做 user 拦截）。
@@ -51,6 +52,7 @@ func TestResolveDoesNotMatchAcrossIdentity(t *testing.T) {
 
 	sr.Bind("", "conv-a", "acc1",
 		&oaiReq{Messages: []oaiMsg{{Role: "user", Content: "继续"}}},
+		"",
 		resolverTestRequest("203.0.113.10", "client-a", "alice"))
 
 	// 不同 IP / UA 的用户输入同样的短消息，不应串到别人的会话。
@@ -61,20 +63,35 @@ func TestResolveDoesNotMatchAcrossIdentity(t *testing.T) {
 	}
 }
 
-func TestResolveSingleMessageNeverReuses(t *testing.T) {
+func TestResolveSingleMessageReusesForSameUser(t *testing.T) {
 	t.Setenv("M365_SESSION_CACHE", filepath.Join(t.TempDir(), "sessions.json"))
 	sr := openSessionResolver()
 
-	sr.Bind("", "conv-short", "acc1",
+	sr.Bind("sess-short", "conv-short", "acc1",
 		&oaiReq{Messages: []oaiMsg{{Role: "user", Content: "继续"}}},
+		"",
 		resolverTestRequest("203.0.113.10", "client-a", "alice"))
 
-	// 单条消息不构成前缀门槛（n>1），即使用户自己重发也不应复用，
-	// 只在多轮上下文中才有复用资格。
 	res := sr.Resolve(resolverTestRequest("203.0.113.10", "client-a", "alice"),
 		&oaiReq{Messages: []oaiMsg{{Role: "user", Content: "继续"}}})
+	if res.IsNew {
+		t.Fatalf("same user re-sending a message should reuse session, got IsNew=true")
+	}
+}
+
+func TestResolveSingleMessageNeverReusesAcrossUsers(t *testing.T) {
+	t.Setenv("M365_SESSION_CACHE", filepath.Join(t.TempDir(), "sessions.json"))
+	sr := openSessionResolver()
+
+	sr.Bind("sess-short", "conv-short", "acc1",
+		&oaiReq{Messages: []oaiMsg{{Role: "user", Content: "继续"}}},
+		"",
+		resolverTestRequest("203.0.113.10", "client-a", "alice"))
+
+	res := sr.Resolve(resolverTestRequest("203.0.113.20", "client-b", "bob"),
+		&oaiReq{Messages: []oaiMsg{{Role: "user", Content: "继续"}}})
 	if !res.IsNew {
-		t.Fatalf("单条短消息不应复用会话，got matched=%s", res.MatchedBy)
+		t.Fatalf("different user must not reuse session, got matched=%s", res.MatchedBy)
 	}
 }
 
@@ -93,6 +110,7 @@ func TestResolverIncrementalBoundary(t *testing.T) {
 			{Role: "user", Content: "第一轮问题"},
 			{Role: "assistant", Content: "第一轮回答"},
 		}},
+		"",
 		httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil))
 
 	// 第二轮只应发送历史之外的新增消息。
@@ -122,6 +140,7 @@ func TestResolverEvictsAfterTTL(t *testing.T) {
 	sr := openSessionResolver()
 	sr.Bind("sess-old", "conv-old", "acc1",
 		&oaiReq{Messages: []oaiMsg{{Role: "user", Content: "旧问题"}}},
+		"",
 		httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil))
 
 	// 把会话标记为超过默认 2h 闲置。
@@ -149,6 +168,7 @@ func TestResolverPersistsHistoryAcrossReload(t *testing.T) {
 			{Role: "user", Content: "persisted question"},
 			{Role: "assistant", Content: "persisted answer"},
 		}},
+		"",
 		httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil))
 	if err := sr1.persist.flushNowBlocking(); err != nil {
 		t.Fatal(err)

@@ -30,13 +30,16 @@ func IsRateLimited(err error) bool {
 	}
 	var httpErr *UpstreamHTTPError
 	if errors.As(err, &httpErr) {
-		return httpErr.Status == 429 || httpErr.Status == 503
+		return httpErr.Status == 429 || httpErr.Status == 503 ||
+			(httpErr.Status == 502 && strings.Contains(strings.ToLower(httpErr.Body), "limited"))
 	}
 	msg := strings.ToLower(err.Error())
 	return strings.Contains(msg, "429") ||
 		strings.Contains(msg, "too many requests") ||
 		strings.Contains(msg, "rate limit") ||
-		strings.Contains(msg, "throttl")
+		strings.Contains(msg, "throttl") ||
+		strings.Contains(msg, "account is limited") ||
+		strings.Contains(msg, "account limited")
 }
 
 // IsAuthFailure reports whether err represents an upstream 401/403, meaning
@@ -70,10 +73,55 @@ type accountHealth struct {
 	mu       sync.Mutex
 	cooldown map[string]time.Time
 	authFail map[string]bool
+	calls    map[string]uint64
 }
 
 func newAccountHealth() *accountHealth {
-	return &accountHealth{cooldown: map[string]time.Time{}, authFail: map[string]bool{}}
+	return &accountHealth{cooldown: map[string]time.Time{}, authFail: map[string]bool{}, calls: map[string]uint64{}}
+}
+
+func (h *accountHealth) clearExpiredCooldownLocked(accountID string) {
+	until, ok := h.cooldown[accountID]
+	if !ok || time.Now().Before(until) {
+		return
+	}
+	delete(h.cooldown, accountID)
+	if !h.authFail[accountID] {
+		delete(h.calls, accountID)
+	}
+}
+
+func (h *accountHealth) MarkCall(accountID string) {
+	if h == nil {
+		return
+	}
+	h.mu.Lock()
+	h.clearExpiredCooldownLocked(accountID)
+	h.calls[accountID]++
+	h.mu.Unlock()
+}
+
+func (h *accountHealth) CallCount(accountID string) uint64 {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.clearExpiredCooldownLocked(accountID)
+	return h.calls[accountID]
+}
+
+func (h *accountHealth) RateLimited(accountID string) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.clearExpiredCooldownLocked(accountID)
+	_, ok := h.cooldown[accountID]
+	return ok && !h.authFail[accountID]
+}
+
+func (h *accountHealth) CooldownUntil(accountID string) (time.Time, bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.clearExpiredCooldownLocked(accountID)
+	until, ok := h.cooldown[accountID]
+	return until, ok
 }
 
 // MarkFailure records the outcome of a request for one account.
@@ -90,7 +138,7 @@ func (h *accountHealth) MarkFailure(accountID string, err error, window time.Dur
 			cooldown = 2 * time.Minute
 		}
 		h.cooldown[accountID] = time.Now().Add(cooldown)
-		delete(h.authFail, accountID)
+		h.authFail[accountID] = true
 		return
 	}
 	if IsRateLimited(err) {
@@ -111,8 +159,12 @@ func (h *accountHealth) MarkSuccess(accountID string) {
 func (h *accountHealth) Available(accountID string) bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	h.clearExpiredCooldownLocked(accountID)
 	if h.authFail[accountID] {
-		return false
+		if _, ok := h.cooldown[accountID]; ok {
+			return false
+		}
+		delete(h.authFail, accountID)
 	}
 	if until, ok := h.cooldown[accountID]; ok && time.Now().Before(until) {
 		return false
@@ -124,6 +176,9 @@ func (h *accountHealth) Available(accountID string) bool {
 func (h *accountHealth) Snapshot() map[string]map[string]any {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	for id := range h.cooldown {
+		h.clearExpiredCooldownLocked(id)
+	}
 	out := make(map[string]map[string]any, len(h.cooldown)+len(h.authFail))
 	for id, until := range h.cooldown {
 		out[id] = map[string]any{"available": time.Now().After(until), "cooldownUntil": until}

@@ -1,6 +1,7 @@
 package web
 
 import (
+	"fmt"
 	"net/http"
 	"time"
 
@@ -50,14 +51,37 @@ func (t toolResponse) usage() map[string]any {
 	}
 }
 
-func writeToolResponse(w http.ResponseWriter, t toolResponse) error {
+func writeToolResponse(w http.ResponseWriter, args ...any) error {
+	var t toolResponse
+	switch len(args) {
+	case 1:
+		var ok bool
+		t, ok = args[0].(toolResponse)
+		if !ok {
+			return fmt.Errorf("invalid tool response")
+		}
+	case 5:
+		id, idOK := args[0].(string)
+		model, modelOK := args[1].(string)
+		stream, streamOK := args[2].(bool)
+		calls, callsOK := args[3].([]detectedToolCall)
+		result, resultOK := args[4].(chathub.Result)
+		if !idOK || !modelOK || !streamOK || !callsOK || !resultOK {
+			return fmt.Errorf("invalid legacy tool response")
+		}
+		t = toolResponse{
+			ID: id, Model: model, Stream: stream, Calls: calls, Result: result,
+		}
+	default:
+		return fmt.Errorf("invalid tool response argument count: %d", len(args))
+	}
 	toolCalls := toolCallMaps(t.Calls)
 	msg := map[string]any{"role": "assistant", "content": nil, "tool_calls": toolCalls}
 	if t.Preamble != "" {
 		msg["content"] = t.Preamble
 	}
-	if t.Result.Reasoning != "" {
-		msg["reasoning_content"] = t.Result.Reasoning
+	if reasoning := sanitizePublicReasoningText(t.Result.Reasoning); reasoning != "" {
+		msg["reasoning_content"] = reasoning
 	}
 	created := time.Now().Unix()
 	if t.Stream {
@@ -78,8 +102,8 @@ func writeToolResponse(w http.ResponseWriter, t toolResponse) error {
 		if t.Preamble != "" {
 			firstDelta["content"] = t.Preamble
 		}
-		if t.Result.Reasoning != "" {
-			firstDelta["reasoning_content"] = t.Result.Reasoning
+		if reasoning := sanitizePublicReasoningText(t.Result.Reasoning); reasoning != "" {
+			firstDelta["reasoning_content"] = reasoning
 		}
 		emit(base(firstDelta, nil))
 		for i, tc := range t.Calls {

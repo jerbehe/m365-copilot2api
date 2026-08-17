@@ -31,3 +31,37 @@ func TestUpsertAndList(t *testing.T) {
 		t.Fatalf("expected 1 account, got %d", len(list))
 	}
 }
+
+func TestScheduleEnabledPersists(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "tokens.json")
+	store, err := OpenStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	token := TokenSet{AccessToken: "a", RefreshToken: "r", Email: "a@example.com", HomeOID: "oid-1", ExpiresAt: time.Now().Add(time.Hour)}
+	if _, err := store.Upsert(token); err != nil {
+		t.Fatal(err)
+	}
+	if !store.ScheduleEnabled("oid-1") {
+		t.Fatal("new account scheduling disabled")
+	}
+	if err := store.SetScheduleEnabled("oid-1", false); err != nil {
+		t.Fatal(err)
+	}
+	if store.ScheduleEnabled("oid-1") {
+		t.Fatal("account scheduling still enabled")
+	}
+	if _, err := store.Upsert(token); err != nil {
+		t.Fatal(err)
+	}
+	if store.ScheduleEnabled("oid-1") {
+		t.Fatal("upsert reset scheduling state")
+	}
+	reopened, err := OpenStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reopened.ScheduleEnabled("oid-1") {
+		t.Fatal("scheduling state was not persisted")
+	}
+}
