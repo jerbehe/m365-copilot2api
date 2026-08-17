@@ -103,6 +103,9 @@ body{background:var(--bg);color:var(--text);font-family:"Inter","SF Pro Display"
 .table tr:hover td{background:rgba(0,113,227,0.03)}
 @media(prefers-color-scheme:dark){.table tr:hover td{background:rgba(10,132,255,0.04)}}
 .table tr:last-child td{border-bottom:0}
+.conv-row{cursor:pointer}
+.conv-link{display:block;max-width:360px;padding:0;border:0;background:transparent;color:var(--accent);font:inherit;font-weight:600;text-align:left;white-space:normal;overflow-wrap:anywhere;cursor:pointer}
+.conv-meta{font-size:11px;color:var(--muted);margin-top:3px}
 
 /* Notice */
 .notice{position:fixed;right:24px;bottom:24px;background:var(--primary);color:var(--bg);padding:12px 18px;border-radius:var(--radius-sm);display:none;box-shadow:var(--shadow-lg);font-weight:600;font-size:13px;z-index:99;animation:slideUp .3s var(--ease-out)}
@@ -119,6 +122,7 @@ body{background:var(--bg);color:var(--text);font-family:"Inter","SF Pro Display"
 .status i{width:6px;height:6px;border-radius:50%;background:currentColor}
 .status.online{color:var(--green)}
 .status.offline{color:var(--muted)}
+.status.cooldown{color:#d97706}
 .status.warn{color:#d97706}
 
 /* Empty */
@@ -284,8 +288,8 @@ body{background:var(--bg);color:var(--text);font-family:"Inter","SF Pro Display"
     <form id="loginForm" style="background:var(--surface);-webkit-backdrop-filter:blur(40px) saturate(180%);backdrop-filter:blur(40px) saturate(180%);border:1px solid var(--surface-border);border-radius:var(--radius);padding:32px;box-shadow:var(--shadow-lg)">
       <div class="form-group">
         <label class="form-label">Password</label>
-        <input class="form-input" id="loginPassword" type="password" placeholder="Enter administrator password (default: admin123)" autofocus>
-        <div class="form-hint" style="margin-top:4px">Default password is <code>admin123</code>. You will be required to change it after first login.</div>
+        <input class="form-input" id="loginPassword" type="password" placeholder="请输入管理员密码（默认：admin123）" autofocus>
+        <div class="form-hint" style="margin-top:4px">默认密码为 <code>admin123</code>，首次登录后需修改密码。</div>
       </div>
       <button type="submit" class="btn primary" style="width:100%;margin-top:8px">Log in</button>
     </form>
@@ -494,23 +498,23 @@ if (response.output_text) {
               <div class="onb-step">
                 <span class="onb-step-num">1</span>
                 <span class="onb-step-icon"><i data-lucide="mouse-pointer-click" style="width:15px;height:15px"></i></span>
-                <span class="onb-step-text"><b>Click "Start authorization" below</b><p>A popup will open the Microsoft sign-in page. Complete sign-in there, then come back to this page.</p></span>
+                <span class="onb-step-text"><b>点击下方"开始授权"</b><p>弹出窗口将打开 Microsoft 登录页面，完成登录后返回此页面。</p></span>
               </div>
               <div class="onb-step">
                 <span class="onb-step-num">2</span>
                 <span class="onb-step-icon"><i data-lucide="clipboard-copy" style="width:15px;height:15px"></i></span>
-                <span class="onb-step-text"><b>Copy the callback URL from the popup's address bar</b><p>After signing in, the popup will show a blank or error page — this is normal. Copy the full URL from the <b>popup's address bar</b> (it contains <code>code=...</code> and <code>state=...</code>).</p></span>
+                <span class="onb-step-text"><b>复制弹出页地址栏中的回调地址</b><p>登录后弹出页会显示空白或错误——这是正常的。复制<b>弹出页地址栏</b>的完整网址（包含 <code>code=...</code> 和 <code>state=...</code>）。</p></span>
               </div>
               <div class="onb-step">
                 <span class="onb-step-num">3</span>
                 <span class="onb-step-icon"><i data-lucide="check-check" style="width:15px;height:15px"></i></span>
-                <span class="onb-step-text"><b>Paste and confirm</b><p>Paste it into the Callback URL field below and click "Confirm and add" to finish authorization</p></span>
+                <span class="onb-step-text"><b>粘贴并确认</b><p>粘贴到下方"回调地址"输入框，点击"确认添加"完成授权</p></span>
               </div>
             </div>
             <button class="btn primary" onclick="startPKCE()" style="width:100%;margin-bottom:12px;"><i data-lucide="link" style="width:15px;height:15px"></i> Start authorization</button>
             <div class="highlight-box warning" style="margin-top:0;margin-bottom:16px">
-              <div class="highlight-box-title"><i data-lucide="alert-circle" style="width:14px;height:14px"></i> You must manually paste the callback URL to complete authorization</div>
-              <p>After signing in on the popup, it will display a blank or error page — <strong>this is normal</strong> because the callback endpoint is not a real website. The authorization is <strong>not</strong> complete yet. Copy the <strong>full URL from the popup's address bar</strong> (it will look like <code>http://localhost:4141/api/auth/callback?code=M.C5...&state=abc123</code>) and paste it into the Callback URL field below.</p>
+              <div class="highlight-box-title"><i data-lucide="alert-circle" style="width:14px;height:14px"></i> 必须手动粘贴回调地址以完成授权</div>
+              <p>在弹出窗口中登录后，页面会显示空白或错误——<strong>这是正常的</strong>，因为回调端点不是真正的网站。授权<strong>尚未</strong>完成。复制弹出页地址栏中的<strong>完整网址</strong>（形如 <code>http://localhost:4141/api/auth/callback?code=M.C5...&state=abc123</code>），粘贴到下方"回调地址"输入框。</p>
             </div>
             <label class="form-label">Callback URL</label>
             <div class="copy-field">
@@ -528,11 +532,12 @@ if (response.output_text) {
               <div class="seg" id="accountFilter">
                 <button data-f="all" class="active" onclick="setAccountFilter('all')">All</button>
                 <button data-f="online" onclick="setAccountFilter('online')">Online</button>
+                <button data-f="cooldown" onclick="setAccountFilter('cooldown')">Cooldown</button>
                 <button data-f="offline" onclick="setAccountFilter('offline')">Offline</button>
               </div>
             </div>
           </div>
-          <table class="table"><thead><tr><th>Account</th><th>Status</th><th>Updated</th><th>Actions</th></tr></thead><tbody id="accountRows"><tr><td colspan="4" class="empty">Loading...</td></tr></tbody></table>
+          <table class="table"><thead><tr><th>Account</th><th>Calls</th><th>Status</th><th>Updated</th><th>Scheduling</th><th>Actions</th></tr></thead><tbody id="accountRows"><tr><td colspan="6" class="empty">Loading...</td></tr></tbody></table>
         </div>
       </section>
 
@@ -566,7 +571,7 @@ if (response.output_text) {
         </div>
         <div class="card">
           <div class="card-head"><span class="card-title">Conversation list</span></div>
-          <table class="table"><thead><tr><th>Conversation ID</th><th>Name</th><th>Created</th><th>Actions</th></tr></thead><tbody id="convRows"><tr><td colspan="4" class="empty">Loading...</td></tr></tbody></table>
+          <table class="table"><thead><tr><th>Name</th><th>Messages</th><th>Account</th><th>Last updated</th><th>Actions</th></tr></thead><tbody id="convRows"><tr><td colspan="5" class="empty">Loading...</td></tr></tbody></table>
         </div>
       </section>
 
@@ -618,12 +623,12 @@ if (response.output_text) {
 <div class="modal-overlay" id="keyModal">
   <div class="modal">
     <h3>Create API key</h3>
-    <p class="subtitle">This key authenticates requests to the OpenAI / Anthropic compatible API. The full key is shown only once — copy and save it now. After creation, click "Use key" in the key list for client configuration examples.</p>
+    <p class="subtitle">此密钥用于认证 OpenAI / Anthropic 兼容接口的请求。完整密钥仅显示一次——请立即复制保存。创建后可在密钥列表中点击"使用密钥"查看客户端配置示例。</p>
     <form onsubmit="createKey(event)">
       <div class="form-group">
         <label class="form-label">Name</label>
         <input class="form-input" id="keyName" value="default" autofocus>
-        <div class="form-hint">A label to identify this key (e.g. "my-laptop", "claude-code")</div>
+        <div class="form-hint">用于标识此密钥的标签（如"my-laptop"、"claude-code"）</div>
       </div>
       <div class="modal-actions">
         <button type="button" class="btn" onclick="closeKeyModal()">Cancel</button>
@@ -737,6 +742,9 @@ const localeText={
   'Endpoint': {'zh-CN':'端点','zh-TW':'端點','ja':'エンドポイント','ko':'엔드포인트','es':'Punto final','fr':'Point d\'entrée','de':'Endpunkt','pt-BR':'Endpoint','ru':'Конечная точка','ar':'نقطة النهاية'},
   'Tokens': {'zh-CN':'Tokens','zh-TW':'Tokens','ja':'トークン','ko':'토큰','es':'Tokens','fr':'Tokens','de':'Tokens','pt-BR':'Tokens','ru':'Токены','ar':'الرموز'},
   'Status': {'zh-CN':'状态','zh-TW':'狀態','ja':'ステータス','ko':'상태','es':'Estado','fr':'Statut','de':'Status','pt-BR':'Status','ru':'Статус','ar':'الحالة'},
+  'Calls': {'zh-CN':'调用次数','zh-TW':'呼叫次數','ja':'呼び出し回数','ko':'호출 횟수','es':'Llamadas','fr':'Appels','de':'Aufrufe','pt-BR':'Chamadas','ru':'Вызовы','ar':'الاستدعاءات'},
+  'Scheduling': {'zh-CN':'调度','zh-TW':'調度','ja':'スケジュール','ko':'스케줄링','es':'Programación','fr':'Planification','de':'Planung','pt-BR':'Agendamento','ru':'Планирование','ar':'الجدولة'},
+  'Enabled': {'zh-CN':'已启用','zh-TW':'已啟用','ja':'有効','ko':'활성화됨','es':'Habilitado','fr':'Activé','de':'Aktiviert','pt-BR':'Ativado','ru':'Включено','ar':'مفعّل'},
   'Loading...': {'zh-CN':'加载中...','zh-TW':'載入中...','ja':'読み込み中...','ko':'로딩 중...','es':'Cargando...','fr':'Chargement...','de':'Wird geladen...','pt-BR':'Carregando...','ru':'Загрузка...','ar':'جارٍ التحميل...'},
   'Token usage statistics and request details': {'zh-CN':'Token 用量统计与请求明细','zh-TW':'Token 用量統計與要求明細','ja':'トークン使用量の統計とリクエスト詳細','ko':'토큰 사용 통계 및 요청 상세','es':'Estadísticas de uso de tokens y detalles de solicitudes','fr':'Statistiques d\'utilisation des tokens et détails des requêtes','de':'Token-Nutzungsstatistik und Anfragedetails','pt-BR':'Estatísticas de uso de tokens e detalhes de solicitações','ru':'Статистика использования токенов и детали запросов','ar':'إحصائيات استخدام الرموز وتفاصيل الطلبات'},
   '7 days': {'zh-CN':'7天','zh-TW':'7天','ja':'7日','ko':'7일','es':'7 días','fr':'7 jours','de':'7 Tage','pt-BR':'7 dias','ru':'7 дней','ar':'7 أيام'},
@@ -780,6 +788,7 @@ const localeText={
   'Authorized accounts': {'zh-CN':'已授权账号','zh-TW':'已授權帳號','ja':'承認済みアカウント','ko':'인증된 계정','es':'Cuentas autorizadas','fr':'Comptes autorisés','de':'Autorisierte Konten','pt-BR':'Contas autorizadas','ru':'Авторизованные аккаунты','ar':'الحسابات المفوضة'},
   'Search accounts…': {'zh-CN':'搜索账号…','zh-TW':'搜尋帳號…','ja':'アカウントを検索…','ko':'계정 검색…','es':'Buscar cuentas…','fr':'Rechercher des comptes…','de':'Konten suchen…','pt-BR':'Pesquisar contas…','ru':'Поиск аккаунтов…','ar':'البحث عن الحسابات…'},
   'All': {'zh-CN':'全部','zh-TW':'全部','ja':'すべて','ko':'전체','es':'Todos','fr':'Tous','de':'Alle','pt-BR':'Todos','ru':'Все','ar':'الكل'},
+  'Cooldown': {'zh-CN':'冷却','zh-TW':'冷卻','ja':'クールダウン','ko':'쿨다운','es':'Enfriamiento','fr':'Refroidissement','de':'Abkühlung','pt-BR':'Resfriamento','ru':'Ожидание','ar':'التهدئة'},
   'Offline': {'zh-CN':'离线','zh-TW':'離線','ja':'オフライン','ko':'오프라인','es':'Sin conexión','fr':'Hors ligne','de':'Offline','pt-BR':'Offline','ru':'Не в сети','ar':'غير متصل'},
   'Updated': {'zh-CN':'更新时间','zh-TW':'更新時間','ja':'更新日時','ko':'업데이트 시간','es':'Actualizado','fr':'Mis à jour','de':'Aktualisiert','pt-BR':'Atualizado','ru':'Обновлено','ar':'تم التحديث'},
   'Actions': {'zh-CN':'操作','zh-TW':'操作','ja':'操作','ko':'작업','es':'Acciones','fr':'Actions','de':'Aktionen','pt-BR':'Ações','ru':'Действия','ar':'الإجراءات'},
@@ -797,6 +806,9 @@ const localeText={
   'Clear': {'zh-CN':'清空','zh-TW':'清空','ja':'クリア','ko':'지우기','es':'Borrar','fr':'Effacer','de':'Leeren','pt-BR':'Limpar','ru':'Очистить','ar':'مسح'},
   'Conversation list': {'zh-CN':'对话列表','zh-TW':'對話列表','ja':'会話一覧','ko':'대화 목록','es':'Lista de conversaciones','fr':'Liste des conversations','de':'Unterhaltungsliste','pt-BR':'Lista de conversas','ru':'Список разговоров','ar':'قائمة المحادثات'},
   'Conversation ID': {'zh-CN':'对话 ID','zh-TW':'對話 ID','ja':'会話 ID','ko':'대화 ID','es':'ID de conversación','fr':'ID de conversation','de':'Unterhaltungs-ID','pt-BR':'ID da conversa','ru':'ID разговора','ar':'معرف المحادثة'},
+  'Messages': {'zh-CN':'消息数','zh-TW':'訊息數','ja':'メッセージ数','ko':'메시지 수','es':'Mensajes','fr':'Messages','de':'Nachrichten','pt-BR':'Mensagens','ru':'Сообщения','ar':'الرسائل'},
+  'Last updated': {'zh-CN':'最近更新','zh-TW':'最近更新','ja':'最終更新','ko':'최근 업데이트','es':'Última actualización','fr':'Dernière mise à jour','de':'Zuletzt aktualisiert','pt-BR':'Última atualização','ru':'Последнее обновление','ar':'آخر تحديث'},
+  'View': {'zh-CN':'查看','zh-TW':'檢視','ja':'表示','ko':'보기','es':'Ver','fr':'Voir','de':'Anzeigen','pt-BR':'Ver','ru':'Открыть','ar':'عرض'},
   'Configure outbound proxies with http / https / socks5 and automatic failover': {'zh-CN':'配置出口代理，支持 http / https / socks5，故障自动切换','zh-TW':'設定出口代理，支援 http / https / socks5，故障自動切換','ja':'http / https / socks5 の送信プロキシを設定し、障害時は自動フェイルオーバー','ko':'http / https / socks5 발신 프록시 구성 및 자동 장애 조치','es':'Configure proxies de salida con http / https / socks5 y conmutación automática por error','fr':'Configurez des proxys sortants http / https / socks5 avec bascule automatique','de':'Ausgehende Proxys mit http / https / socks5 und automatischem Failover konfigurieren','pt-BR':'Configure proxies de saída com http / https / socks5 e failover automático','ru':'Настройте исходящие прокси http / https / socks5 с автоматическим переключением','ar':'قم بتكوين بروكسيات الخروج http / https / socks5 مع التبديل التلقائي'},
   'Check all': {'zh-CN':'全部健康检查','zh-TW':'全部健康檢查','ja':'すべてチェック','ko':'전체 확인','es':'Comprobar todo','fr':'Tout vérifier','de':'Alle prüfen','pt-BR':'Verificar tudo','ru':'Проверить все','ar':'فحص الكل'},
   'Add proxy': {'zh-CN':'添加代理','zh-TW':'新增代理','ja':'プロキシを追加','ko':'프록시 추가','es':'Añadir proxy','fr':'Ajouter un proxy','de':'Proxy hinzufügen','pt-BR':'Adicionar proxy','ru':'Добавить прокси','ar':'إضافة بروكسي'},
@@ -865,7 +877,9 @@ const localeTextReverse=localeReverse();
 function translateDynamic(value,locale){
   if(!value)return value;
   if(locale==='zh'||locale.startsWith('zh')){
-    let m=value.match(/^(\d+) requests today$/);if(m)return '今日 '+m[1]+' 次请求';
+    let m=value.match(/^Called (\d+) times$/);if(m)return locale==='zh-TW'?'已呼叫'+m[1]+'次':'已调用'+m[1]+'次';
+    m=value.match(/^Limited after (\d+) calls$/);if(m)return locale==='zh-TW'?'呼叫'+m[1]+'次限流':'调用'+m[1]+'次限流';
+    m=value.match(/^(\d+) requests today$/);if(m)return '今日 '+m[1]+' 次请求';
     m=value.match(/^(\d+) requests$/);if(m)return m[1]+' 次请求';
     m=value.match(/^Hit rate (.+)$/);if(m)return '命中率 '+m[1];
     m=value.match(/^Today \+(\d+)$/);if(m)return '今日 +'+m[1];
@@ -876,7 +890,11 @@ function translateDynamic(value,locale){
     m=value.match(/^Connection healthy: (.+)$/);if(m)return '连通正常：'+m[1];
     m=value.match(/^Finished: (\d+) succeeded, (\d+) failed, (\d+) rounds total\.$/);if(m)return '完成：成功 '+m[1]+' 个，失败 '+m[2]+' 个，共 '+m[3]+' 轮。';
   }else{
-    let m=value.match(/^今日 (\d+) 次请求$/);if(m)return m[1]+' requests today';
+    let m=value.match(/^已调用(\d+)次$/);if(m)return 'Called '+m[1]+' times';
+    m=value.match(/^已呼叫(\d+)次$/);if(m)return 'Called '+m[1]+' times';
+    m=value.match(/^调用(\d+)次限流$/);if(m)return 'Limited after '+m[1]+' calls';
+    m=value.match(/^呼叫(\d+)次限流$/);if(m)return 'Limited after '+m[1]+' calls';
+    m=value.match(/^今日 (\d+) 次请求$/);if(m)return m[1]+' requests today';
     m=value.match(/^(\d+) 次请求$/);if(m)return m[1]+' requests';
     m=value.match(/^命中率 (.+)$/);if(m)return 'Hit rate '+m[1];
     m=value.match(/^今日 \+(\d+)$/);if(m)return 'Today +'+m[1];
@@ -949,6 +967,7 @@ function showPage(p){
   if(p==='conversations')loadConversations();
   if(p==='proxies')loadProxies();
   if(p==='modeltest')loadModelTest();
+  if(p==='settings')loadSettings();
 }
 
 let onboardingHidden=false;
@@ -966,7 +985,7 @@ function buildCurl(keyPrefix){
   return `curl ${base}/v1/chat/completions \\\n  -H "Content-Type: application/json" \\\n  -H "Authorization: Bearer ${keyPrefix}..." \\\n  -d '{"model":"auto","messages":[{"role":"user","content":"Say hello in one sentence."}]}'`;
 }
 async function copyCurl(){
-  try{await navigator.clipboard.writeText($('onbCurl').textContent.trim());showNotice('curl copied','success');}catch(e){}
+  try{await navigator.clipboard.writeText($('onbCurl').textContent.trim());showNotice('curl 已复制','success');}catch(e){}
 }
 async function loadOnboarding(){
   let acc=0,key=0,prefix='sk-';
@@ -997,16 +1016,10 @@ $('loginForm')?.addEventListener('submit',async e=>{
   e.preventDefault();
   try{
     const d=await api('/api/admin/login',{method:'POST',body:JSON.stringify({password:$('loginPassword').value})});
-    if(d.must_change_password){
-      const np=prompt('You must change the default password before continuing.\nEnter new password (min 6 characters):');
-      if(!np||np.length<6){showNotice('Password must be at least 6 characters','error');return;}
-      await api('/api/admin/change-password',{method:'POST',body:JSON.stringify({current_password:$('loginPassword').value,new_password:np})});
-      showNotice('Password changed. Please log in again with the new password.','success');
-      return;
-    }
+    if(d.must_change_password){location.replace('/login');return;}
     $('login').style.display='none';$('app').style.display='flex';
     showPage('dashboard');loadStats();
-    showNotice('Logged in successfully','success');
+    showNotice('登录成功','success');
   }catch(e){showNotice(e.message,'error');}
 });
 
@@ -1056,23 +1069,39 @@ function renderAccounts(){
   const q=($('accountSearch').value||'').trim().toLowerCase();
   const list=_accountsCache.filter(x=>{
     if(_accountFilter==='online'&&x.status!=='online')return false;
-    if(_accountFilter==='offline'&&x.status==='online')return false;
+    if(_accountFilter==='cooldown'&&x.status!=='cooldown')return false;
+    if(_accountFilter==='offline'&&(x.status==='online'||x.status==='cooldown'))return false;
     if(q&&!((x.displayName||'')+' '+(x.email||'')).toLowerCase().includes(q))return false;
     return true;
   });
-  $('accountRows').innerHTML=list.length?list.map(x=>`<tr><td><div class="account-cell"><div class="avatar">${(x.displayName||x.email||'M')[0]}</div><div><b>${x.displayName||x.email}</b><div style="font-size:11px;color:var(--muted)">${x.email||''}</div></div></div></td><td><span class="status ${x.status==='online'?'online':'offline'}"><i></i>${x.status==='online'?'Online':'Offline'}</span></td><td style="font-size:12px;color:var(--muted)">${x.updatedAt?new Date(x.updatedAt).toLocaleString():'-'}</td><td><button class="btn-sm btn danger" onclick="deleteAccount('${x.id}')">Delete</button></td></tr>`).join(''):'<tr><td colspan="4" class="empty">No matching accounts</td></tr>';
+  $('accountRows').innerHTML=list.length?list.map(x=>{
+    const cooldown=x.cooldownUntil?`<div style="font-size:11px;color:var(--muted);margin-top:3px"><span>Cooldown until</span> ${new Date(x.cooldownUntil).toLocaleString()}</div>`:'';
+    const status=x.status==='cooldown'?`<div><span class="status cooldown"><i></i>Cooldown</span>${cooldown}</div>`:x.status==='online'?'<span class="status online"><i></i>Online</span>':'<span class="status offline"><i></i>Offline</span>';
+    const calls=x.rateLimited?`Limited after ${x.callCount||0} calls`:`Called ${x.callCount||0} times`;
+    const scheduleEnabled=x.scheduleEnabled!==false;
+    return `<tr><td><div class="account-cell"><div class="avatar">${(x.displayName||x.email||'M')[0]}</div><div><b>${x.displayName||x.email}</b><div style="font-size:11px;color:var(--muted)">${x.email||''}</div></div></div></td><td style="font-size:12px;white-space:nowrap">${calls}</td><td>${status}</td><td style="font-size:12px;color:var(--muted)">${x.updatedAt?new Date(x.updatedAt).toLocaleString():'-'}</td><td><button class="btn-sm btn${scheduleEnabled?'':' danger'}" onclick="toggleAccountSchedule('${x.id}',${!scheduleEnabled})">${scheduleEnabled?'Enabled':'Disabled'}</button></td><td><button class="btn-sm btn danger" onclick="deleteAccount('${x.id}')">Delete</button></td></tr>`;
+  }).join(''):'<tr><td colspan="6" class="empty">No matching accounts</td></tr>';
 }
 async function loadAccounts(){
   try{
     const d=await api('/api/accounts');
     _accountsCache=d.accounts||[];
     renderAccounts();
-  }catch(e){$('accountRows').innerHTML=`<tr><td colspan="4" class="empty">${e.message}</td></tr>`;}
+  }catch(e){$('accountRows').innerHTML=`<tr><td colspan="6" class="empty">${e.message}</td></tr>`;}
+}
+
+async function toggleAccountSchedule(id,enabled){
+  try{
+    await api('/api/accounts/schedule',{method:'POST',body:JSON.stringify({id,enabled})});
+    const account=_accountsCache.find(x=>x.id===id);
+    if(account)account.scheduleEnabled=enabled;
+    renderAccounts();
+  }catch(e){showNotice(e.message,'error');}
 }
 
 async function deleteAccount(id){
-  if(!confirm('Delete this account?'))return;
-  try{await api('/api/accounts/delete',{method:'POST',body:JSON.stringify({id})});showNotice('Deleted','success');loadAccounts();showPage('dashboard');}
+  if(!confirm('确定删除此账号？'))return;
+  try{await api('/api/accounts/delete',{method:'POST',body:JSON.stringify({id})});showNotice('已删除','success');loadAccounts();showPage('dashboard');}
   catch(e){showNotice(e.message,'error');}
 }
 
@@ -1081,18 +1110,18 @@ async function startPKCE(){
     const d=await api('/api/auth/start');
     $('callbackInput').dataset.state=d.state;
     const popup=window.open(d.url,'pkce','width=600,height=800');
-    if(!popup){$('authStatus').innerHTML='<div class="highlight-box warning"><div class="highlight-box-title"><i data-lucide="alert-circle" style="width:14px;height:14px"></i>Popup blocked by browser</div><p>Please allow popups for this site, then click "Start authorization" again.</p></div>';lucide.createIcons();return;}
-    $('authStatus').innerHTML='<div class="highlight-box"><div class="highlight-box-title"><i data-lucide="info" style="width:14px;height:14px"></i>Authorization page opened in a new window</div><p>Complete the sign-in in the popup. After signing in, the popup will show a blank or error page — this is normal. Copy the <b>full URL from the popup\'s address bar</b> and paste it into the Callback URL field below.</p></div>';
+    if(!popup){$('authStatus').innerHTML='<div class="highlight-box warning"><div class="highlight-box-title"><i data-lucide="alert-circle" style="width:14px;height:14px"></i>弹出窗口被浏览器拦截</div><p>请允许此网站的弹出窗口，然后重新点击"开始授权"。</p></div>';lucide.createIcons();return;}
+    $('authStatus').innerHTML='<div class="highlight-box"><div class="highlight-box-title"><i data-lucide="info" style="width:14px;height:14px"></i>授权页面已在新窗口打开</div><p>请在弹出窗口中完成登录。登录后弹出页会显示空白或错误——这是正常的。复制弹出页地址栏的<b>完整网址</b>，粘贴到下方"回调地址"输入框。</p></div>';
     $('callbackInput').focus();
-    $('callbackInput').placeholder='Paste the full callback URL from the popup address bar…';
+    $('callbackInput').placeholder='粘贴弹出页地址栏中的完整回调地址…';
     if(pkceTimer)clearInterval(pkceTimer);
     const start=Date.now();
     pkceTimer=setInterval(async()=>{
-      if(Date.now()-start>600000){clearInterval(pkceTimer);$('authStatus').innerHTML='<div class="highlight-box warning"><b>Authorization timed out. Start authorization again.</b></div>';return;}
-      if(popup&&popup.closed){clearInterval(pkceTimer);$('authStatus').innerHTML='<div class="highlight-box warning"><b>The authorization window was closed before completion.</b></div>';return;}
+      if(Date.now()-start>600000){clearInterval(pkceTimer);$('authStatus').innerHTML='<div class="highlight-box warning"><b>授权超时，请重新开始授权。</b></div>';return;}
+      if(popup&&popup.closed){clearInterval(pkceTimer);$('authStatus').innerHTML='<div class="highlight-box warning"><b>授权窗口在完成前已关闭。</b></div>';return;}
       try{const s=await api('/api/auth/status?state='+d.state);
-        if(s.status==='authenticated'){clearInterval(pkceTimer);$('authStatus').innerHTML='<div class="highlight-box success"><div class="highlight-box-title"><i data-lucide="check-circle" style="width:14px;height:14px"></i>Authorization successful</div><p>Account added to the account pool.</p></div>';showNotice('Authorization successful','success');loadAccounts();}
-        if(s.status==='error'||s.status==='expired'){clearInterval(pkceTimer);$('authStatus').innerHTML='<div class="highlight-box warning"><b>Authorization failed or expired</b></div>';}
+        if(s.status==='authenticated'){clearInterval(pkceTimer);$('authStatus').innerHTML='<div class="highlight-box success"><div class="highlight-box-title"><i data-lucide="check-circle" style="width:14px;height:14px"></i>授权成功</div><p>账号已加入账号池。</p></div>';showNotice('授权成功','success');loadAccounts();}
+        if(s.status==='error'||s.status==='expired'){clearInterval(pkceTimer);$('authStatus').innerHTML='<div class="highlight-box warning"><b>授权失败或已过期</b></div>';}
       }catch(e){}
     },2000);
   }catch(e){showNotice(e.message,'error');}
@@ -1100,12 +1129,12 @@ async function startPKCE(){
 
 async function submitCallback(){
   const raw=$('callbackInput').value.trim();
-  if(!raw)return showNotice('Paste the callback URL','error');
+  if(!raw)return showNotice('请粘贴回调地址','error');
   try{
     let u='/api/auth/callback?';
     if(raw.includes('://')){u+='url='+encodeURIComponent(raw);}
     else{u+=raw.replace(/^\?/,'');if(!raw.includes('state='))$('callbackInput').dataset.state&&(u+='&state='+$('callbackInput').dataset.state);}
-    await api(u);showNotice('Authorization successful','success');$('callbackInput').value='';loadAccounts();showPage('dashboard');
+    await api(u);showNotice('授权成功','success');$('callbackInput').value='';loadAccounts();showPage('dashboard');
   }catch(e){showNotice(e.message,'error');}
 }
 
@@ -1127,8 +1156,8 @@ function editKey(id,name){editKeyId=id;$('editKeyName').value=name;$('editKeyMod
 function closeEditKeyModal(){$('editKeyModal').classList.remove('open');editKeyId=null;}
 async function saveEditKey(){
   const name=$('editKeyName').value.trim();
-  if(!name)return showNotice('Name cannot be empty','error');
-  try{await api('/api/admin/keys',{method:'PUT',body:JSON.stringify({id:editKeyId,name})});closeEditKeyModal();showNotice('Updated','success');loadKeys();}
+  if(!name)return showNotice('名称不能为空','error');
+  try{await api('/api/admin/keys',{method:'PUT',body:JSON.stringify({id:editKeyId,name})});closeEditKeyModal();showNotice('已更新','success');loadKeys();}
   catch(e){showNotice(e.message,'error');}
 }
 async function toggleKey(id,revoked){
@@ -1138,7 +1167,7 @@ async function toggleKey(id,revoked){
 
 function openKeyModal(){$('keyModal').classList.add('open');$('keyResult').style.display='none';$('keyName').value='default';setTimeout(()=>$('keyName').focus(),50);}
 function closeKeyModal(){$('keyModal').classList.remove('open');}
-async function copyKey(){try{await navigator.clipboard.writeText($('keyValue').value);showNotice('Copied','success');}catch(e){}}
+async function copyKey(){try{await navigator.clipboard.writeText($('keyValue').value);showNotice('已复制','success');}catch(e){}}
 async function createKey(e){
   e.preventDefault();
   try{
@@ -1146,7 +1175,7 @@ async function createKey(e){
     $('keyValue').value=d.key;$('keyResult').style.display='block';copyKey();loadKeys();
   }catch(e){showNotice(e.message,'error');}
 }
-async function revokeKey(id){if(!confirm('Delete this key?'))return;try{await api('/api/admin/keys?id='+id,{method:'DELETE'});loadKeys();}catch(e){showNotice(e.message,'error');}}
+async function revokeKey(id){if(!confirm('确定删除此密钥？'))return;try{await api('/api/admin/keys?id='+id,{method:'DELETE'});loadKeys();}catch(e){showNotice(e.message,'error');}}
 
 // ===== Usage page =====
 let usageDays=7, ugPageNo=0, ugTotal=0;
@@ -1289,8 +1318,8 @@ async function openUseKey(id){
   useKeyId=id;
   const d=await api('/api/admin/keys');
   const rec=(d.keys||[]).find(x=>x.id===id);
-  if(!rec){showNotice('Key not found','error');return;}
-  $('useKeyName').textContent='Current key: '+rec.name+' ('+rec.prefix+')';
+  if(!rec){showNotice('找不到密钥','error');return;}
+  $('useKeyName').textContent='当前密钥：'+rec.name+' ('+rec.prefix+')';
   $('useKeyVal').value=rec.raw||'';
   $('useKeyModal').classList.add('open');
   renderUkeTabs();
@@ -1302,10 +1331,10 @@ function renderUkeTabs(){
   $('useKeyOs').innerHTML=ukeOs.map(o=>`<button class="uke-tab ${o.id===ukeOsSel?'active':''}" onclick="ukeOsSel='${o.id}';renderUkeFiles()">${o.label}</button>`).join('');
   try{lucide.createIcons();}catch(e){}
 }
-function esc(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;');}
+function esc(s){return String(s??'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');}
 function ukeFile(path,content){
   return `<div class="uke-file">
-    <div class="uke-file-head"><code>${esc(path)}</code><button class="btn btn-sm" onclick="navigator.clipboard.writeText(this.closest('.uke-file').querySelector('pre').textContent.trim());showNotice('Copied','success')">Copy</button></div>
+    <div class="uke-file-head"><code>${esc(path)}</code><button class="btn btn-sm" onclick="navigator.clipboard.writeText(this.closest('.uke-file').querySelector('pre').textContent.trim());showNotice('已复制','success')">Copy</button></div>
     <pre>${esc(content)}</pre>
   </div>`;
 }
@@ -1375,32 +1404,52 @@ goals = true`;
 }
 async function copyUseKey(){
   const v=$('useKeyVal').value;
-  if(!v){showNotice('Full key is unavailable','error');return;}
-  try{await navigator.clipboard.writeText(v);showNotice('Copied','success');}catch(e){}
+  if(!v){showNotice('完整密钥不可用','error');return;}
+  try{await navigator.clipboard.writeText(v);showNotice('已复制','success');}catch(e){}
 }
 
 async function loadConversations(){
   try{
     const d=await api('/api/m365/conversations');
     const c=d.data||[];
-    $('convRows').innerHTML=c.length?c.map(x=>`<tr><td><code style="font-size:11px">${x.conversationId?.slice(0,16)}...</code></td><td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${x.chatName||'-'}</td><td style="font-size:12px;color:var(--muted)">${x.createTimeUtc?new Date(x.createTimeUtc).toLocaleString():'-'}</td><td><button class="btn-sm btn danger" onclick="deleteConv('${x.conversationId}')">Delete</button></td></tr>`).join(''):'<tr><td colspan="4" class="empty">No conversations</td></tr>';
-  }catch(e){$('convRows').innerHTML=`<tr><td colspan="4" class="empty">${e.message}</td></tr>`;}
+    $('convRows').innerHTML=c.length?c.map(x=>{
+      const id=String(x.conversationId||'');
+      const updated=x.updateTimeUtc||x.createTimeUtc;
+      return `<tr class="conv-row" data-conversation-id="${esc(id)}">
+        <td><button class="conv-link" type="button">${esc(x.chatName||'未命名对话')}</button><div class="conv-meta"><code>${esc(id)}</code></div></td>
+        <td>${Number(x.messageCount||0)}</td>
+        <td>${esc(x.accountEmail||x.accountId||'-')}</td>
+        <td style="font-size:12px;color:var(--muted)">${updated?new Date(updated).toLocaleString():'-'}</td>
+        <td><div style="display:flex;gap:6px"><button class="btn-sm btn" data-conv-action="view">View</button><button class="btn-sm btn danger" data-conv-action="delete">Delete</button></div></td>
+      </tr>`;
+    }).join(''):'<tr><td colspan="5" class="empty">No conversations</td></tr>';
+    $('convRows').querySelectorAll('.conv-row').forEach(row=>{
+      row.addEventListener('click',event=>{
+        const action=event.target.closest('[data-conv-action]')?.dataset.convAction;
+        if(action==='delete'){event.stopPropagation();deleteConv(row.dataset.conversationId);return;}
+        openConversation(row.dataset.conversationId);
+      });
+    });
+    applyLocale(currentLocale);
+  }catch(e){$('convRows').innerHTML=`<tr><td colspan="5" class="empty">${esc(e.message)}</td></tr>`;}
 }
+
+function openConversation(id){window.open('/conversation?id='+encodeURIComponent(id),'_blank','noopener');}
 
 function termOpen(title){$('termTitle').textContent=title;$('termBody').innerHTML='';$('termBox').style.display='block';}
 function termLine(msg,cls){const d=document.createElement('div');if(cls)d.className=cls;d.textContent='> '+msg;$('termBody').appendChild(d);$('termBody').scrollTop=$('termBody').scrollHeight;}
 function termClear(){$('termBody').innerHTML='';}
 
-async function deleteConv(id){if(!confirm('Delete this conversation?'))return;try{await api('/api/m365/conversations/delete',{method:'POST',body:JSON.stringify({conversation_id:id})});showNotice('Deleted','success');loadConversations();}catch(e){showNotice(e.message,'error');}}
+async function deleteConv(id){if(!confirm('确定删除此对话？'))return;try{await api('/api/m365/conversations/delete',{method:'POST',body:JSON.stringify({conversation_id:id})});showNotice('已删除','success');loadConversations();}catch(e){showNotice(e.message,'error');}}
 async function cleanupAll(){
-  const total=confirm('Clean up all conversations?\nEach conversation will be deleted one by one and logged in the terminal.');
+  const total=confirm('确定清理所有对话？\n每条对话将逐一删除并在终端记录日志。');
   if(!total)return;
   termOpen('cleanup — m365-copilot2api');
-  termLine('Starting cleanup of all conversations…');
+  termLine('开始清理所有对话…');
   let ok=0,fail=0,round=0;
   for(round=1;round<=100;round++){
     let d;
-    try{d=await api('/api/m365/conversations');}catch(e){termLine('Failed to get conversation list: '+e.message,'err');break;}
+    try{d=await api('/api/m365/conversations');}catch(e){termLine('获取对话列表失败：'+e.message,'err');break;}
     const c=d.data||[];
     if(!c.length){
       termLine('Round '+round+': list is empty.','dim');
@@ -1409,7 +1458,7 @@ async function cleanupAll(){
     termLine('Round '+round+': found '+c.length+' conversations (paged loading; fetch the next batch after deletion)','dim');
     for(let i=0;i<c.length;i++){
       const x=c[i];
-      const name=x.chatName||'Unnamed';
+      const name=x.chatName||'未命名';
       termLine('['+(i+1)+'/'+c.length+'] Deleting "'+name+'" '+String(x.conversationId||'').slice(0,8)+'…');
       try{
         await api('/api/m365/conversations/delete',{method:'POST',body:JSON.stringify({conversation_id:x.conversationId})});
@@ -1420,7 +1469,7 @@ async function cleanupAll(){
     await new Promise(r=>setTimeout(r,500));
   }
   termLine('Finished: '+ok+' succeeded, '+fail+' failed, '+round+' rounds total.',fail?'warn':'ok');
-  showNotice('Cleanup complete','success');loadConversations();
+  showNotice('清理完成','success');loadConversations();
 }
 
 function proxyRow(x){
@@ -1433,7 +1482,7 @@ function proxyRow(x){
     <td style="font-size:12px;color:var(--muted)">${x.failures||0}</td>
     <td style="font-size:12px;color:var(--muted)">${x.cooldownUntil?new Date(x.cooldownUntil).toLocaleString():'-'}</td>
     <td style="text-align:right;white-space:nowrap">
-      <button class="btn-sm btn" onclick="proxyCheckOne('${esc(x.url)}')">Check</button>
+      <button class="btn-sm btn" onclick="proxyCheckOne('${esc(x.url)}')">检测</button>
       <button class="btn-sm btn danger" onclick="proxyRemove('${esc(x.url)}')">Delete</button>
     </td>
   </tr>`;
@@ -1447,15 +1496,15 @@ async function loadProxies(){
 }
 async function proxyAdd(){
   const raw=$('proxyInput').value.trim();
-  if(!raw)return showNotice('Enter a proxy URL','error');
+  if(!raw)return showNotice('请输入代理地址','error');
   try{
     const d=await api('/api/admin/proxy-pool',{method:'POST',body:JSON.stringify({urls:[raw]})});
     showNotice('Added '+d.added+' proxies','success');$('proxyInput').value='';loadProxies();
   }catch(e){showNotice(e.message,'error');}
 }
 async function proxyRemove(url){
-  if(!confirm('Delete proxy '+url+'?'))return;
-  try{await api('/api/admin/proxy-pool?url='+encodeURIComponent(url),{method:'DELETE'});showNotice('Deleted','success');loadProxies();}
+  if(!confirm('确定删除代理 '+url+'？'))return;
+  try{await api('/api/admin/proxy-pool?url='+encodeURIComponent(url),{method:'DELETE'});showNotice('已删除','success');loadProxies();}
   catch(e){showNotice(e.message,'error');}
 }
 async function proxyCheckOne(url){
@@ -1463,13 +1512,13 @@ async function proxyCheckOne(url){
     const d=await api('/api/admin/proxy-pool?action=check',{method:'PUT',body:JSON.stringify({url})});
     const rec=(d.proxies||[]).find(x=>x.url===url);
     if(rec&&rec.health==='reachable')showNotice('Connection healthy: '+rec.latencyMs+' ms','success');
-    else showNotice(rec&&rec.lastError?rec.lastError:'Connection failed','error');
+    else showNotice(rec&&rec.lastError?rec.lastError:'连接失败','error');
     loadProxies();
   }catch(e){showNotice(e.message,'error');}
 }
 async function proxyCheckAll(){
   termOpen('proxy check — m365-copilot2api');
-  termLine('Checking all proxies…');
+  termLine('正在检测所有代理…');
   try{
     const d=await api('/api/admin/proxy-pool?action=check',{method:'PUT'});
     const p=d.proxies||[];
@@ -1479,7 +1528,7 @@ async function proxyCheckAll(){
       else termLine('✗ '+x.url+(x.lastError?' — '+x.lastError:''),'err');
     }
     termLine('Finished: '+ok+'/'+p.length+' proxies available.',ok===p.length&&p.length?'ok':'warn');
-    showNotice('Health check complete','success');loadProxies();
+    showNotice('健康检查完成','success');loadProxies();
   }catch(e){termLine('Check failed: '+e.message,'err');}
 }
 async function proxyTest(){
@@ -1492,7 +1541,7 @@ async function loadModelTest(){
     const d=await api('/api/admin/models');
     const models=d.data||[];
     if(!models.length){$('modelTestRows').innerHTML='<tr><td colspan="4" class="empty">No models available</td></tr>';return;}
-    $('modelTestRows').innerHTML=models.map(m=>`<tr data-model="${esc(m.id)}"><td><b>${esc(m.id)}</b></td><td><span class="status"><i></i>Not tested</span></td><td style="font-size:12px;color:var(--muted)">-</td><td style="font-size:12px;color:var(--muted)">Click "Test all"</td></tr>`).join('');
+    $('modelTestRows').innerHTML=models.map(m=>`<tr data-model="${esc(m.id)}"><td><b>${esc(m.id)}</b></td><td><span class="status"><i></i>Not tested</span></td><td style="font-size:12px;color:var(--muted)">-</td><td style="font-size:12px;color:var(--muted)">点击"测试全部"</td></tr>`).join('');
   }catch(e){$('modelTestRows').innerHTML=`<tr><td colspan="4" class="empty">${e.message}</td></tr>`;}
 }
 async function modelTestOne(id,row){
@@ -1505,7 +1554,7 @@ async function modelTestOne(id,row){
   try{
     const d=await api('/api/admin/models/test',{method:'POST',body:JSON.stringify({model:id})});
     const ms=Math.round(performance.now()-start);
-    const content=d.reply||'(Empty reply)';
+    const content=d.reply||'（空回复）';
     badge.innerHTML='<span class="status online"><i></i>Healthy</span>';
     lat.textContent=ms+' ms';
     reply.textContent=String(content).slice(0,80);
@@ -1517,29 +1566,41 @@ async function modelTestOne(id,row){
 }
 async function modelTestAll(){
   const rows=[...document.querySelectorAll('#modelTestRows tr[data-model]')];
-  if(!rows.length){showNotice('Load the model list first','error');return;}
+  if(!rows.length){showNotice('请先加载模型列表','error');return;}
   for(let i=0;i<rows.length;i++){
     modelTestOne(rows[i].dataset.model,rows[i]);
     await new Promise(r=>setTimeout(r,250));
   }
-  showNotice('Model test complete','success');
+  showNotice('模型测试完成','success');
 }
 
-async function saveSettings(){  try{
+async function loadSettings(){
+  try{
+    const d=await api('/api/admin/settings');
+    const v=d.settings||{};
+    $('setListen').value=v.listenAddress||'';
+    $('setTimeout').value=v.chatTimeoutSeconds||120;
+  }catch(e){showNotice(e.message,'error');}
+}
+async function saveSettings(){
+  try{
     const listen=$('setListen').value.trim();
     const timeout=$('setTimeout').value.trim();
     const body={};
-    if(listen)body.listen=listen;
+    if(listen)body.listenAddress=listen;
     if(timeout)body.chatTimeoutSeconds=parseInt(timeout);
     await api('/api/admin/settings',{method:'PUT',body:JSON.stringify(body)});
-    showNotice('Settings saved','success');
+    showNotice('设置已保存','success');
   }catch(e){showNotice(e.message,'error');}
 }
+
+setInterval(()=>{if($('page-accounts').style.display!=='none')loadAccounts();},15000);
 
 // Init
 try{lucide.createIcons();}catch(e){}
 fetch('/api/admin/session').then(r=>r.json()).then(d=>{
-  if(d.authenticated){$('login').style.display='none';$('app').style.display='flex';showPage('dashboard');loadStats();loadOnboarding();}
+  if(d.authenticated&&d.must_change_password){location.replace('/login');}
+  else if(d.authenticated){$('login').style.display='none';$('app').style.display='flex';showPage('dashboard');loadStats();loadOnboarding();}
   else{$('login').style.display='grid';}
 }).catch(()=>{$('login').style.display='grid';});
 </script>

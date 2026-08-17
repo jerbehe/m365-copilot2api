@@ -33,7 +33,9 @@ type pendingPKCE struct {
 }
 
 // rateLimitCooldown is how long a rate-limited account stays out of rotation.
-const rateLimitCooldown = 2 * time.Minute
+// Kept short (30s) for faster recovery from upstream 429s; a manual lever
+// (POST /api/accounts/clear-cooldown) exists for immediate resets.
+const rateLimitCooldown = 30 * time.Second
 
 // maxAccountProbe bounds the round-robin walk when skipping unhealthy accounts.
 const maxAccountProbe = 16
@@ -135,6 +137,7 @@ func (s *Server) Routes() http.Handler {
 	m.HandleFunc("/api/admin/change-password", s.adminChangePassword)
 	m.HandleFunc("/api/admin/keys", s.adminKeys)
 	m.HandleFunc("/api/admin/models", s.adminModels)
+	m.HandleFunc("/api/admin/models/sync", s.adminModelSync)
 	m.HandleFunc("/api/admin/models/test", s.adminModelTest)
 	m.HandleFunc("/api/admin/settings", s.adminSettings)
 	m.HandleFunc("/api/admin/proxy-pool", s.proxyPool)
@@ -149,7 +152,10 @@ func (s *Server) Routes() http.Handler {
 	m.HandleFunc("/api/accounts", s.accounts)
 	m.HandleFunc("/api/accounts/schedule", s.scheduleAccount)
 	m.HandleFunc("/api/accounts/refresh", s.refreshAccount)
+	m.HandleFunc("/api/accounts/token-health", s.tokenHealth)
+	m.HandleFunc("/api/accounts/clear-cooldown", s.clearCooldown)
 	m.HandleFunc("/api/accounts/delete", s.deleteAccount)
+	m.HandleFunc("/api/accounts/provision", s.provisionAccount)
 	m.HandleFunc("/api/auth/start", s.startPKCE)
 	m.HandleFunc("/api/auth/status", s.pkceStatus)
 	m.HandleFunc("/api/auth/callback", s.callbackPKCE)
@@ -180,7 +186,7 @@ func (s *Server) Routes() http.Handler {
 
 func (s *Server) adminMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/api/admin/login" || r.URL.Path == "/api/admin/session" || r.URL.Path == "/api/admin/change-password" || r.URL.Path == "/api/admin/logout" || r.URL.Path == "/" || r.URL.Path == "/login" {
+		if r.URL.Path == "/api/admin/login" || r.URL.Path == "/api/admin/session" || r.URL.Path == "/api/admin/change-password" || r.URL.Path == "/api/admin/logout" || r.URL.Path == "/api/auth/start" || r.URL.Path == "/api/auth/status" || r.URL.Path == "/api/auth/callback" || r.URL.Path == "/" || r.URL.Path == "/login" {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -427,37 +433,45 @@ func (s *Server) accounts(w http.ResponseWriter, r *http.Request) {
 	}
 	list := s.tokens.List()
 	type view struct {
-		ID             string     `json:"id"`
-		Email          string     `json:"email"`
-		DisplayName    string     `json:"displayName,omitempty"`
-		Status         string     `json:"status"`
-		OID            string     `json:"oid,omitempty"`
-		TID            string     `json:"tid,omitempty"`
-		ExpiresAt      time.Time  `json:"expiresAt,omitempty"`
-		UpdatedAt      time.Time  `json:"updatedAt,omitempty"`
-		ScheduleEnabled bool      `json:"scheduleEnabled"`
-		CallCount      uint64     `json:"callCount"`
-		CooldownUntil  *time.Time `json:"cooldownUntil"`
+		ID              string     `json:"id"`
+		Email           string     `json:"email"`
+		DisplayName     string     `json:"displayName,omitempty"`
+		Status          string     `json:"status"`
+		ScheduleEnabled bool       `json:"scheduleEnabled"`
+		CallCount       uint64     `json:"callCount"`
+		RateLimited     bool       `json:"rateLimited"`
+		CooldownUntil   *time.Time `json:"cooldownUntil,omitempty"`
+		OID             string     `json:"oid,omitempty"`
+		TID             string     `json:"tid,omitempty"`
+		ExpiresAt       time.Time  `json:"expiresAt,omitempty"`
+		UpdatedAt       time.Time  `json:"updatedAt,omitempty"`
 	}
 	out := make([]view, 0, len(list))
 	for _, a := range list {
-		v := view{
-			ID: a.ID, Email: a.Email, DisplayName: a.DisplayName,
-			Status: a.Status, OID: a.OID, TID: a.TID,
-			ExpiresAt: a.ExpiresAt, UpdatedAt: a.UpdatedAt,
-			ScheduleEnabled: s.tokens.ScheduleEnabled(a.ID),
-			CallCount: s.accountPool.CallCount(a.ID),
-		}
-		if until, ok := s.accountPool.CooldownUntil(a.ID); ok {
-			if time.Now().Before(until) {
-				u := until
-				v.CooldownUntil = &u
-				v.Status = "cooldown"
+		status := a.Status
+		var cooldownUntil *time.Time
+		var callCount uint64
+		var rateLimited bool
+		if s.accountPool != nil {
+			if until, ok := s.accountPool.CooldownUntil(a.ID); ok {
+				status = "cooldown"
+				cooldownUntil = &until
 			}
+			callCount = s.accountPool.CallCount(a.ID)
+			rateLimited = s.accountPool.RateLimited(a.ID)
 		}
-		out = append(out, v)
+		out = append(out, view{
+			ID: a.ID, Email: a.Email, DisplayName: a.DisplayName,
+			Status: status, ScheduleEnabled: s.tokens.ScheduleEnabled(a.ID),
+			CallCount: callCount, RateLimited: rateLimited, CooldownUntil: cooldownUntil,
+			OID: a.OID, TID: a.TID, ExpiresAt: a.ExpiresAt, UpdatedAt: a.UpdatedAt,
+		})
 	}
-	jsonOut(w, map[string]any{"accounts": out})
+	response := map[string]any{"accounts": out}
+	if s.accountPool != nil {
+		response["health"] = s.accountPool.Snapshot()
+	}
+	jsonOut(w, response)
 }
 
 func (s *Server) refreshAccount(w http.ResponseWriter, r *http.Request) {
@@ -665,7 +679,15 @@ func (s *Server) resolveAccount(accountID string) (auth.AccountToken, error) {
 			accountID = acc.ID
 		}
 		if !s.accountAvailable(accountID) {
-			return auth.AccountToken{}, fmt.Errorf("all accounts are cooling down or failing auth; try again later")
+			// Surface a structured 429 with a Retry-After derived from the
+			// earliest recovering account so clients back off instead of
+			// hammering the pool.
+			until := s.accountPool.EarliestRecovery()
+			retry := int(time.Until(until).Seconds())
+			if retry < 5 {
+				retry = 5
+			}
+			return auth.AccountToken{}, &UpstreamHTTPError{Status: 429, RetryAfter: retry, Body: "all accounts are cooling down; try again later"}
 		}
 	}
 	acc, err := s.tokens.EnsureValid(accountID)
@@ -879,6 +901,18 @@ func (s *Server) dropTransientConversation(conversationID string) {
 			log.Printf("[transient-conv] delete failed id=%s err=%v", id, err)
 		}
 	}(conversationID)
+}
+
+// adminModelSync force-refreshes the advertised tone list from upstream so
+// the catalog tracks tenant-side model rollouts without a restart.
+func (s *Server) adminModelSync(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	syncUpstreamTones()
+	tones := liveUpstreamTones()
+	jsonOut(w, map[string]any{"synced": true, "upstream_tones": tones, "count": len(tones)})
 }
 
 func (s *Server) adminModels(w http.ResponseWriter, r *http.Request) {

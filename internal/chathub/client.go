@@ -4,12 +4,14 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"m365-copilot2api/internal/outbound"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -22,6 +24,21 @@ func minInt(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// ErrEmptyCompletion marks an upstream turn that finished without producing
+// any text; the tone may be unavailable for this tenant.
+var ErrEmptyCompletion = errors.New("upstream returned empty completion; tone may be unavailable for this tenant")
+
+// DialError carries the HTTP status and optional Retry-After from a failed
+// WebSocket dial so the web layer can route it into the correct cooldown.
+type DialError struct {
+	Status     int
+	RetryAfter int
+}
+
+func (e *DialError) Error() string {
+	return fmt.Sprintf("ws dial: upstream %d", e.Status)
 }
 
 const (
@@ -173,9 +190,17 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 	}
 
 	dialStarted := time.Now()
-	conn, _, err := c.Dialer.DialContext(ctx, wsURL, c.HTTPHeader.Clone())
+	conn, resp, err := c.Dialer.DialContext(ctx, wsURL, c.HTTPHeader.Clone())
 	log.Printf("chathub timing ws_dial_ms=%d total_ms=%d", time.Since(dialStarted).Milliseconds(), time.Since(startedAt).Milliseconds())
 	if err != nil {
+		if resp != nil && (resp.StatusCode == 429 || resp.StatusCode == 401 || resp.StatusCode == 403) {
+			retryAfter := 0
+			if v, _ := strconv.Atoi(resp.Header.Get("Retry-After")); v > 0 {
+				retryAfter = v
+			}
+			log.Printf("chathub ws_dial %d Retry-After=%d", resp.StatusCode, retryAfter)
+			return Result{}, &DialError{Status: resp.StatusCode, RetryAfter: retryAfter}
+		}
 		return Result{}, fmt.Errorf("ws dial: %w", err)
 	}
 	defer conn.Close()
@@ -235,6 +260,21 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 	var events []json.RawMessage
 	seenStreamTools := map[string]bool{}
 	var reasoningBuf strings.Builder
+
+	// Upstream rate limiting can surface as a human-readable notice on the
+	// text channel instead of an HTTP 429. Detect it before any real content
+	// has streamed so the web layer can fail over rather than answer with it.
+	rateLimited := func(text string) bool {
+		if answer.Emitted() != 0 {
+			return false
+		}
+		t := strings.ToLower(text)
+		return strings.Contains(t, "temporarily unable to respond to this many requests") ||
+			strings.Contains(t, "太多请求") ||
+			strings.Contains(t, "无法响应这么多请求") ||
+			strings.Contains(t, "too many requests") ||
+			strings.Contains(t, "please retry") && strings.Contains(t, "later")
+	}
 
 	deadline := time.Now().Add(5 * time.Minute)
 	type wsRead struct {
@@ -343,6 +383,9 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 							if author == "bot" && mt == "" && text != "" {
 								// ChatHub often sends the first visible text as a full snapshot,
 								// followed by cursor deltas. Emit only the unseen suffix.
+								if rateLimited(text) {
+									return Result{}, ErrRateLimitNotice
+								}
 								if err := emitSnapshot(text); err != nil {
 									return Result{}, err
 								}
@@ -363,6 +406,9 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 						rawResult, _ = res["value"].(string)
 						if msg, ok := res["message"].(string); ok {
 							final = msg
+							if rateLimited(final) {
+								return Result{}, ErrRateLimitNotice
+							}
 						}
 					}
 				}
@@ -384,6 +430,12 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 				text := final
 				if text == "" {
 					text = answer.Text()
+				}
+				if rateLimited(text) {
+					return Result{}, ErrRateLimitNotice
+				}
+				if text == "" {
+					return Result{}, ErrEmptyCompletion
 				}
 				return Result{
 					Text:           text,

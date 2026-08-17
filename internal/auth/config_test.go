@@ -58,6 +58,9 @@ func TestBrowserAndDeviceConfigurationAreIsolated(t *testing.T) {
 	if DeviceClientID() != "device-client" || DeviceAuthority() != "https://login.microsoftonline.com/consumers" || DeviceScope() != "device-scope" {
 		t.Fatal("device-code configuration was not isolated")
 	}
+	if got := DeviceTokenEndpoint(); got != "https://login.microsoftonline.com/consumers/oauth2/v2.0/token" {
+		t.Fatalf("DeviceTokenEndpoint() = %q", got)
+	}
 }
 
 func TestLegacyOAuthConfigurationRemainsCompatible(t *testing.T) {

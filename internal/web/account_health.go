@@ -6,6 +6,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"m365-copilot2api/internal/chathub"
 )
 
 // UpstreamHTTPError carries the HTTP status of a failed upstream request so
@@ -28,18 +30,24 @@ func IsRateLimited(err error) bool {
 	if err == nil {
 		return false
 	}
+	if errors.Is(err, chathub.ErrRateLimitNotice) {
+		return true
+	}
 	var httpErr *UpstreamHTTPError
 	if errors.As(err, &httpErr) {
 		return httpErr.Status == 429 || httpErr.Status == 503 ||
 			(httpErr.Status == 502 && strings.Contains(strings.ToLower(httpErr.Body), "limited"))
+	}
+	var dialErr *chathub.DialError
+	if errors.As(err, &dialErr) {
+		return dialErr.Status == 429 || dialErr.Status == 503
 	}
 	msg := strings.ToLower(err.Error())
 	return strings.Contains(msg, "429") ||
 		strings.Contains(msg, "too many requests") ||
 		strings.Contains(msg, "rate limit") ||
 		strings.Contains(msg, "throttl") ||
-		strings.Contains(msg, "account is limited") ||
-		strings.Contains(msg, "account limited")
+		strings.Contains(msg, "limited")
 }
 
 // IsAuthFailure reports whether err represents an upstream 401/403, meaning
@@ -52,6 +60,10 @@ func IsAuthFailure(err error) bool {
 	if errors.As(err, &httpErr) {
 		return httpErr.Status == 401 || httpErr.Status == 403
 	}
+	var dialErr *chathub.DialError
+	if errors.As(err, &dialErr) {
+		return dialErr.Status == 401 || dialErr.Status == 403
+	}
 	return false
 }
 
@@ -63,7 +75,17 @@ func RetryAfterSeconds(err error) int {
 	if errors.As(err, &httpErr) {
 		return httpErr.RetryAfter
 	}
+	var dialErr *chathub.DialError
+	if errors.As(err, &dialErr) {
+		return dialErr.RetryAfter
+	}
 	return 0
+}
+
+// IsEmptyCompletion reports whether the upstream finished a turn without any
+// text — the requested tone may be unavailable for this tenant.
+func IsEmptyCompletion(err error) bool {
+	return errors.Is(err, chathub.ErrEmptyCompletion)
 }
 
 // accountHealth tracks per-account failure state: rate-limited accounts are
@@ -192,4 +214,29 @@ func (h *accountHealth) Snapshot() map[string]map[string]any {
 		}
 	}
 	return out
+}
+
+// ClearAllCooldowns resets every cooldown, auth-fail pin and call counter.
+// Exposed through POST /api/accounts/clear-cooldown as a manual recovery
+// lever for the admin console.
+func (h *accountHealth) ClearAllCooldowns() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.cooldown = map[string]time.Time{}
+	h.authFail = map[string]bool{}
+	h.calls = map[string]uint64{}
+}
+
+// EarliestRecovery returns the earliest time at which any account may become
+// available again. Used to populate Retry-After when all accounts are cooling.
+func (h *accountHealth) EarliestRecovery() time.Time {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	earliest := time.Now().Add(5 * time.Minute)
+	for _, until := range h.cooldown {
+		if until.Before(earliest) {
+			earliest = until
+		}
+	}
+	return earliest
 }

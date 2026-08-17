@@ -5,20 +5,9 @@ import (
 	"fmt"
 	"log"
 	"net/http"
-	"strings"
 
 	"m365-copilot2api/internal/auth"
 )
-
-func IsEmptyCompletion(err error) bool {
-	if err == nil {
-		return false
-	}
-	message := strings.ToLower(err.Error())
-	return strings.Contains(message, "empty completion") ||
-		strings.Contains(message, "empty response") ||
-		strings.Contains(message, "before completion")
-}
 
 func logOAuthError(stage string, err error) {
 	var oauthErr *auth.OAuthError
