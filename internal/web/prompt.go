@@ -6,8 +6,6 @@ import (
 	"strings"
 )
 
-// flattenPromptMessages adapts role-based messages to ChatHub's single text field
-// without losing instruction priority or tool-call identity.
 func flattenPromptMessages(messages []oaiMsg, attachments []chathub.Attachment) (string, []chathub.Attachment) {
 	var b strings.Builder
 	for _, m := range messages {

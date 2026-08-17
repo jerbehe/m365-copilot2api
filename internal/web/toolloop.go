@@ -137,32 +137,41 @@ func callID(name, args string, index int) string {
 }
 
 func extractToolCalls(text string, tools []map[string]any, choice any) ([]detectedToolCall, bool) {
-	start := strings.Index(text, "<m365-tool-call>")
-	end := strings.Index(text, "</m365-tool-call>")
-	if start < 0 || end <= start {
-		return nil, false
-	}
-	var raw any
-	if json.Unmarshal([]byte(text[start+len("<m365-tool-call>"):end]), &raw) != nil {
-		return nil, false
-	}
-	items := []any{raw}
-	if arr, ok := raw.([]any); ok {
-		items = arr
-	}
 	allowed := allowedToolNames(tools)
-	out := make([]detectedToolCall, 0, len(items))
-	for i, item := range items {
-		m, ok := item.(map[string]any)
-		if !ok {
+	var out []detectedToolCall
+	remaining := text
+	for {
+		start := strings.Index(remaining, "<m365-tool-call>")
+		if start < 0 {
+			break
+		}
+		end := strings.Index(remaining[start:], "</m365-tool-call>")
+		if end < 0 {
+			break
+		}
+		end += start
+		content := remaining[start+len("<m365-tool-call>"):end]
+		remaining = remaining[end+len("</m365-tool-call>"):]
+		var raw any
+		if json.Unmarshal([]byte(content), &raw) != nil {
 			continue
 		}
-		n, _ := m["name"].(string)
-		if !allowed[n] || !toolChoiceAllows(choice, n) {
-			continue
+		items := []any{raw}
+		if arr, ok := raw.([]any); ok {
+			items = arr
 		}
-		a, _ := json.Marshal(m["arguments"])
-		out = append(out, detectedToolCall{ID: callID(n, string(a), i), Type: toolType(n, tools), Name: n, Arguments: a})
+		for _, item := range items {
+			m, ok := item.(map[string]any)
+			if !ok {
+				continue
+			}
+			n, _ := m["name"].(string)
+			if !allowed[n] || !toolChoiceAllows(choice, n) {
+				continue
+			}
+			a, _ := json.Marshal(m["arguments"])
+			out = append(out, detectedToolCall{ID: callID(n, string(a), len(out)), Type: toolType(n, tools), Name: n, Arguments: a})
+		}
 	}
 	return out, len(out) > 0
 }
