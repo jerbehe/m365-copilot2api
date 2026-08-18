@@ -168,6 +168,7 @@ func (s *Server) Routes() http.Handler {
 	m.HandleFunc("/v1/sessions", s.handleSessions)
 	m.HandleFunc("/v1/sessions/", s.handleSessionDelete)
 	m.HandleFunc("/api/m365/conversations", s.handleM365Conversations)
+	m.HandleFunc("/api/m365/conversations/detail", s.handleM365ConversationDetail)
 	m.HandleFunc("/api/m365/conversations/delete", s.handleM365Delete)
 	m.HandleFunc("/api/m365/conversations/cleanup", s.handleM365Cleanup)
 	m.HandleFunc("/api/stats", s.handleCacheStats)

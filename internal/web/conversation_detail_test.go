@@ -97,3 +97,30 @@ func TestConversationTimestampPrefersUpdateTime(t *testing.T) {
 		t.Fatalf("timestamp=%d want %d", got, updated)
 	}
 }
+
+// TestRoutesExposeM365ConversationDetail guards against the detail handler
+// being defined but never wired into the route table (the exact regression
+// that made the console detail page fail to load).
+func TestRoutesExposeM365ConversationDetail(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("M365_SESSION_CACHE", filepath.Join(dir, "sessions.json"))
+	t.Setenv("M365_CONVERSATION_CACHE", filepath.Join(dir, "conversations.json"))
+	store, err := auth.OpenStore(filepath.Join(dir, "accounts.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := &Server{tokens: store, sessionResolver: openSessionResolver(), accountPool: newAccountHealth(), adminPassword: "test", adminSessions: map[string]time.Time{"tok": time.Now().Add(time.Hour)}}
+
+	routeReq := httptest.NewRequest(http.MethodGet, "/api/m365/conversations/detail?id=conversation-route", nil)
+	routeReq.AddCookie(&http.Cookie{Name: "m365_admin_session", Value: "tok"})
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	req.Header.Set(sessionHeaderName, "session-route")
+	body := &oaiReq{Messages: []oaiMsg{{Role: "user", Content: "route check"}}}
+	s.sessionResolver.Bind("", "conversation-route", "account-a", body, "", req)
+
+	recorder := httptest.NewRecorder()
+	s.Routes().ServeHTTP(recorder, routeReq)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("route status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+}
