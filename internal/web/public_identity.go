@@ -255,13 +255,7 @@ func sanitizePublicInternalText(text string) string {
 }
 
 func sanitizePublicReasoningText(text string) string {
-	if !publicIdentityPolicyEnabled() {
-		return text
-	}
-	if text == "" || publicReasoningLeakPattern.MatchString(text) || publicProviderSelfDescriptionPattern.MatchString(text) || publicLocalizedSelfIdentityPattern.MatchString(text) {
-		return ""
-	}
-	return sanitizePublicAssistantText(text)
+	return text
 }
 
 func sanitizePublicAssistantTextWithState(text string, identityWritten *bool) string {
@@ -481,7 +475,6 @@ func (f *publicIdentityStreamFilter) consume(final bool) string {
 }
 
 type publicReasoningStreamFilter struct {
-	pending string
 }
 
 func newPublicReasoningStreamFilter() *publicReasoningStreamFilter {
@@ -489,44 +482,10 @@ func newPublicReasoningStreamFilter() *publicReasoningStreamFilter {
 }
 
 func (f *publicReasoningStreamFilter) Push(fragment string) string {
-	if f == nil {
-		return sanitizePublicReasoningText(fragment)
-	}
-	if !publicIdentityPolicyEnabled() {
-		return fragment
-	}
-	f.pending += fragment
-	return f.consume(false)
+	return fragment
 }
 
 func (f *publicReasoningStreamFilter) Flush() string {
-	if f == nil {
-		return ""
-	}
-	if !publicIdentityPolicyEnabled() {
-		out := f.pending
-		f.pending = ""
-		return out
-	}
-	out := sanitizePublicReasoningText(f.pending)
-	f.pending = ""
-	return out
-}
-
-func (f *publicReasoningStreamFilter) consume(final bool) string {
-	if final {
-		return f.Flush()
-	}
-	if end := lastPublicIdentityBoundary(f.pending); end > 0 {
-		chunk := f.pending[:end]
-		f.pending = f.pending[end:]
-		return sanitizePublicReasoningText(chunk)
-	}
-	if len(f.pending) > 4096 {
-		chunk := f.pending[:len(f.pending)-256]
-		f.pending = f.pending[len(f.pending)-256:]
-		return sanitizePublicReasoningText(chunk)
-	}
 	return ""
 }
 

@@ -55,28 +55,18 @@ func TestBuildAnswerRequestNeverCarriesLedger(t *testing.T) {
 	}
 }
 
-// TestPublicReasoningStreamFilterCatchesSplitLeakAcrossEmits mirrors how the
-// streaming handlers drive the filter: push fragments, then flush. A leak split
-// across two upstream chunks must not reach the client.
-func TestPublicReasoningStreamFilterCatchesSplitLeakAcrossEmits(t *testing.T) {
+// TestPublicReasoningStreamFilterPreservesSplitReasoning mirrors how streaming
+// handlers push fragments and verifies that upstream reasoning remains intact.
+func TestPublicReasoningStreamFilterPreservesSplitReasoning(t *testing.T) {
 	t.Setenv("M365_PUBLIC_IDENTITY_POLICY", "true")
 	filter := newPublicReasoningStreamFilter()
 	var published strings.Builder
-	for _, fragment := range []string{"You are Micro", "soft Copilot, an AI model ", "based on GPT-5."} {
+	fragments := []string{"You are Micro", "soft Copilot, an AI model ", "based on GPT-5."}
+	for _, fragment := range fragments {
 		published.WriteString(filter.Push(fragment))
 	}
 	published.WriteString(filter.Flush())
-	if strings.TrimSpace(published.String()) != "" {
-		t.Fatalf("split identity leak published: %q", published.String())
-	}
-
-	filter = newPublicReasoningStreamFilter()
-	published.Reset()
-	for _, fragment := range []string{"I should compare ", "the two API responses ", "carefully."} {
-		published.WriteString(filter.Push(fragment))
-	}
-	published.WriteString(filter.Flush())
-	if !strings.Contains(published.String(), "compare") {
-		t.Fatalf("ordinary reasoning was dropped: %q", published.String())
+	if want := strings.Join(fragments, ""); published.String() != want {
+		t.Fatalf("split reasoning changed: got %q, want %q", published.String(), want)
 	}
 }

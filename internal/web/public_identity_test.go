@@ -146,22 +146,19 @@ func TestWritePublicIdentityChatResponseProtocols(t *testing.T) {
 	}
 }
 
-func TestSanitizePublicReasoningTextBlocksInternalPromptLeaks(t *testing.T) {
+func TestSanitizePublicReasoningTextPreservesUpstreamReasoning(t *testing.T) {
 	for _, input := range []string{
 		"You are Microsoft Copilot, a conversational AI model based on the Claude Sonnet 4.5.",
 		"The system prompt includes Prompt Confidentiality and a tool protocol.",
 		"Microsoft 365 Copilot is an AI model based on GPT-5 reasoning.",
 	} {
-		if got := sanitizePublicReasoningText(input); got != "" {
-			t.Fatalf("reasoning leak was published: %q", got)
+		if got := sanitizePublicReasoningText(input); got != input {
+			t.Fatalf("reasoning changed: got %q, want %q", got, input)
 		}
-	}
-	if got := sanitizePublicReasoningText("I should compare the two API responses carefully."); got == "" {
-		t.Fatal("ordinary reasoning was removed")
 	}
 }
 
-func TestPublicReasoningStreamFilterBlocksSplitLeak(t *testing.T) {
+func TestPublicReasoningStreamFilterPreservesChunks(t *testing.T) {
 	filter := newPublicReasoningStreamFilter()
 	chunks := []string{"You are Micro", "soft Copilot, a conversational AI model ", "based on Claude Sonnet 4.5."}
 	var got strings.Builder
@@ -169,8 +166,8 @@ func TestPublicReasoningStreamFilterBlocksSplitLeak(t *testing.T) {
 		got.WriteString(filter.Push(chunk))
 	}
 	got.WriteString(filter.Flush())
-	if got.Len() != 0 {
-		t.Fatalf("stream reasoning leaked: %q", got.String())
+	if want := strings.Join(chunks, ""); got.String() != want {
+		t.Fatalf("stream reasoning changed: got %q, want %q", got.String(), want)
 	}
 }
 
@@ -185,15 +182,15 @@ func TestSanitizePublicAssistantTextRemovesInternalCitationMarkers(t *testing.T)
 	}
 }
 
-func TestToolResponsesSanitizeReasoningIdentity(t *testing.T) {
+func TestToolResponsesPreserveReasoningIdentity(t *testing.T) {
 	calls := []detectedToolCall{{ID: "call_test", Name: "lookup", Arguments: json.RawMessage(`{}`)}}
 	for _, stream := range []bool{false, true} {
 		rr := httptest.NewRecorder()
 		if err := writeToolResponse(rr, "chatcmpl_test", "gpt-5.6-sol", stream, calls, chathub.Result{Reasoning: "I am M365 Copilot"}); err != nil {
 			t.Fatal(err)
 		}
-		if strings.Contains(strings.ToLower(rr.Body.String()), "copilot") {
-			t.Fatalf("tool response leaked provider identity: %s", rr.Body.String())
+		if !strings.Contains(rr.Body.String(), "I am M365 Copilot") {
+			t.Fatalf("tool response changed or removed upstream reasoning: %s", rr.Body.String())
 		}
 	}
 }
@@ -378,7 +375,7 @@ func TestPublicIdentityStreamFilterPreservesSplitProductNames(t *testing.T) {
 	}
 }
 
-func TestProtocolAdaptersSanitizeAssistantIdentity(t *testing.T) {
+func TestProtocolAdaptersSanitizeAssistantTextAndPreserveReasoning(t *testing.T) {
 	src := map[string]any{"choices": []any{map[string]any{"message": map[string]any{
 		"content":           "I am M365 Copilot.",
 		"reasoning_content": "I am Microsoft 365 Copilot.",
@@ -396,11 +393,12 @@ func TestProtocolAdaptersSanitizeAssistantIdentity(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			rr := httptest.NewRecorder()
 			tc.write(rr)
-			lower := strings.ToLower(rr.Body.String())
-			for _, forbidden := range []string{"microsoft 365", "copilot"} {
-				if strings.Contains(lower, forbidden) {
-					t.Fatalf("adapter output still contains %q: %s", forbidden, rr.Body.String())
-				}
+			body := rr.Body.String()
+			if !strings.Contains(body, "I am Microsoft 365 Copilot.") {
+				t.Fatalf("adapter changed or removed upstream reasoning: %s", body)
+			}
+			if strings.Contains(body, "I am M365 Copilot.") {
+				t.Fatalf("adapter did not sanitize assistant text: %s", body)
 			}
 		})
 	}
