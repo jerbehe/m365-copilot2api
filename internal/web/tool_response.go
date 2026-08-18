@@ -51,6 +51,22 @@ func (t toolResponse) usage() map[string]any {
 	}
 }
 
+// routerToolResult adapts a private router/retry result for client delivery.
+// The router request carries gateway-internal instructions (the tool protocol
+// envelope and the compact evidence ledger), so ChatHub's chain-of-thought for
+// that turn discusses tool selection and the ledger itself. Forwarding it as
+// public reasoning prints gateway internals to the client, so only the fields
+// the response metadata needs survive.
+func routerToolResult(res chathub.Result) chathub.Result {
+	return chathub.Result{
+		Text:           res.Text,
+		ConversationID: res.ConversationID,
+		SessionID:      res.SessionID,
+		RequestID:      res.RequestID,
+		Throttling:     res.Throttling,
+	}
+}
+
 func writeToolResponse(w http.ResponseWriter, args ...any) error {
 	var t toolResponse
 	switch len(args) {

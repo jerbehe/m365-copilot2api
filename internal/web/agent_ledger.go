@@ -130,10 +130,23 @@ func (l agentLedger) RouterContext() string {
 	return hint + "\nEVIDENCE_LEDGER: " + string(b)
 }
 
+// buildAnswerRequest builds the final-answer ChatHub request. It is the single
+// construction point for both the streaming and non-streaming answer turns so
+// the prompt cannot diverge between them.
+//
+// The answer prompt stays identical to the client conversation. Tool routing
+// instructions and the compact evidence ledger belong exclusively to the private
+// router request: injecting them here contaminates ChatHub's native
+// ChainOfThoughtSummary, so public agent_reasoning ends up repeatedly discussing
+// tool selection and echoing EVIDENCE_LEDGER back at the user. The evidence is
+// already present in prompt — flattenPromptMessages renders every tool_calls and
+// tool-result message — so nothing is lost by leaving the ledger out.
+//
+// The completion guard (completionEvidenceAllows) enforces the "do not claim
+// unverified success" rule after the fact, which is where that check belongs:
+// it inspects the answer instead of asking the model to police itself.
 func buildAnswerRequest(prompt, tone string, body oaiReq, ledger agentLedger, mode string) chathub.Request {
-	if len(ledger.Completed) > 0 || len(ledger.Pending) > 0 {
-		prompt += "\n\n" + ledger.RouterContext() + "\nReport only actions supported by completed tool results."
-	}
+	_ = ledger
 	req := chathub.Request{
 		Text:           prompt,
 		Tone:           tone,

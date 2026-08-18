@@ -2,7 +2,6 @@ package web
 
 import (
 	"encoding/json"
-	"strings"
 	"testing"
 
 	"m365-copilot2api/internal/chathub"
@@ -37,12 +36,10 @@ func TestBuildAnswerRequestNativeForwardsTools(t *testing.T) {
 	}
 }
 
-func TestBuildAnswerRequestAddsCompletedEvidence(t *testing.T) {
+func TestBuildAnswerRequestDoesNotInjectRouterEvidence(t *testing.T) {
 	ledger := agentLedger{Completed: []toolEvidence{{ID: "call_1", Name: "read_file", Arguments: `{}`, Result: "ok"}}}
 	req := buildAnswerRequest("[user]\nsummarize", "magic", answerRequestTestBody(), ledger, "router")
-	for _, want := range []string{"EVIDENCE_LEDGER:", "Report only actions supported by completed tool results"} {
-		if !strings.Contains(req.Text, want) {
-			t.Fatalf("answer prompt missing %q: %s", want, req.Text)
-		}
+	if req.Text != "[user]\nsummarize" {
+		t.Fatalf("router evidence contaminated final answer prompt: %q", req.Text)
 	}
 }

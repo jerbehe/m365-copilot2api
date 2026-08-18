@@ -1249,16 +1249,17 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			calls = limitToolCalls(calls, adaptiveToolCallLimit(calls, configuredToolCallLimit(s.settings)))
 			// routeRes.Text is the router's raw JSON decision, not prose, so no
 			// preamble is forwarded from it.
-			_ = writeToolResponse(w, toolResponse{ID: "chatcmpl-" + uuid.NewString(), Model: firstNonEmpty(body.Model, "m365-copilot"), Stream: true, Calls: calls, Result: routeRes, Prompt: prompt, Options: body.StreamOptions})
+			_ = writeToolResponse(w, toolResponse{ID: "chatcmpl-" + uuid.NewString(), Model: firstNonEmpty(body.Model, "m365-copilot"), Stream: true, Calls: calls, Result: routerToolResult(routeRes), Prompt: prompt, Options: body.StreamOptions})
 			return
 		}
 	}
 	if body.Stream {
-		if len(toolMaps) > 0 || len(ledger.Completed) > 0 || len(ledger.Pending) > 0 {
-			answerPrompt = answerPrompt + "\n" + ledger.RouterContext() + "\nFINAL ANSWER RULE: Answer the user directly. If a tool is explicitly required, emit its structured call; otherwise return ordinary text."
-		}
 		log.Printf("[req-trace] id=%s stage=answer_start prompt_len=%d", requestID, len(answerPrompt))
-		answerReq := chathub.Request{Text: answerPrompt, Tone: tone, ConversationID: body.ConversationID, SessionID: body.SessionID, Attachments: body.Attachments, Tools: body.Tools, ToolChoice: body.ToolChoice}
+		// The streaming answer always forwards the client's native tool
+		// declarations: the router branch above already returned when it selected
+		// a call, so reaching here means the turn may still need to call a tool
+		// itself.
+		answerReq := buildAnswerRequest(answerPrompt, tone, body, ledger, "native")
 		id := "chatcmpl-" + uuid.NewString()
 		model := firstNonEmpty(body.Model, "m365-copilot")
 		usage := newStreamUsage(body.StreamOptions, answerPrompt)
@@ -1282,6 +1283,11 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		// it, and reasoning is not an answer.
 		textEmitted := false
 		narration := newNarrationGate(toolMaps)
+		// Reasoning is published verbatim, so it needs the same identity scrub the
+		// non-streaming path applies. The stream filter buffers across chunk
+		// boundaries: a leak split as "You are Micro" + "soft Copilot" would slip
+		// past a per-fragment check.
+		reasoningFilter := newPublicReasoningStreamFilter()
 		// writeDelta emits one chunk, stamping the assistant role onto whichever
 		// delta happens to be first: a reasoning delta may precede any text.
 		writeDelta := func(delta map[string]any) error {
@@ -1316,10 +1322,19 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			return writeDelta(map[string]any{"content": part})
 		}
 		emitReasoning := func(part string) error {
+			part = reasoningFilter.Push(part)
 			if part == "" {
 				return nil
 			}
 			// Reasoning counts toward completion tokens: the client received it.
+			usage.addCompletion(part)
+			return writeDelta(map[string]any{"reasoning_content": part})
+		}
+		flushReasoning := func() error {
+			part := reasoningFilter.Flush()
+			if part == "" {
+				return nil
+			}
 			usage.addCompletion(part)
 			return writeDelta(map[string]any{"reasoning_content": part})
 		}
@@ -1384,6 +1399,12 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.accountPool.MarkSuccess(acc.ID)
+		// The reasoning filter holds a tail back so a leak spanning two chunks is
+		// still caught; release it now that no further reasoning can arrive.
+		if err := flushReasoning(); err != nil {
+			log.Printf("[req-trace] id=%s stage=stream_write err=%v", requestID, err)
+			return
+		}
 		// Some ChatHub updates contain no text event and place the completed
 		// answer only in the final Result. Recover it before deciding that the
 		// response is empty; this also preserves fenced-tool parsing.
@@ -1483,7 +1504,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			}
 			calls = limitToolCalls(calls, adaptiveToolCallLimit(calls, configuredToolCallLimit(s.settings)))
 			// Router output is a JSON decision, never prose.
-			_ = writeToolResponse(w, toolResponse{ID: "chatcmpl-" + uuid.NewString(), Model: firstNonEmpty(body.Model, "m365-copilot"), Stream: body.Stream, Calls: calls, Result: routeRes, Prompt: prompt, Options: body.StreamOptions})
+			_ = writeToolResponse(w, toolResponse{ID: "chatcmpl-" + uuid.NewString(), Model: firstNonEmpty(body.Model, "m365-copilot"), Stream: body.Stream, Calls: calls, Result: routerToolResult(routeRes), Prompt: prompt, Options: body.StreamOptions})
 			return
 		}
 		if fmt.Sprint(body.ToolChoice) == "required" {
@@ -1501,7 +1522,7 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 						calls[i].ID = scopedCallID(calls[i].Name, string(calls[i].Arguments), i, scope)
 					}
 					calls = limitToolCalls(calls, adaptiveToolCallLimit(calls, configuredToolCallLimit(s.settings)))
-					_ = writeToolResponse(w, toolResponse{ID: "chatcmpl-" + uuid.NewString(), Model: firstNonEmpty(body.Model, "m365-copilot"), Stream: body.Stream, Calls: calls, Result: retryRes, Prompt: prompt, Options: body.StreamOptions})
+					_ = writeToolResponse(w, toolResponse{ID: "chatcmpl-" + uuid.NewString(), Model: firstNonEmpty(body.Model, "m365-copilot"), Stream: body.Stream, Calls: calls, Result: routerToolResult(retryRes), Prompt: prompt, Options: body.StreamOptions})
 					return
 				}
 			}
@@ -1509,17 +1530,7 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 			return
 		}
 	}
-	if len(ledger.Completed) > 0 || len(ledger.Pending) > 0 {
-		answerPrompt += "\n" + ledger.RouterContext()
-	}
-	if len(ledger.Completed) > 0 {
-		answerPrompt += "\nFINAL ANSWER RULE: Report only actions supported by completed tool results. If the goal is not fully verified, state exactly what remains unconfirmed."
-	}
-	answerReq := chathub.Request{Text: answerPrompt, Tone: tone, ConversationID: body.ConversationID, SessionID: body.SessionID, Attachments: body.Attachments}
-	if planningMode == "native" {
-		answerReq.Tools = body.Tools
-		answerReq.ToolChoice = body.ToolChoice
-	}
+	answerReq := buildAnswerRequest(answerPrompt, tone, body, ledger, planningMode)
 	var res chathub.Result
 	if body.Stream {
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -1559,6 +1570,9 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 			return nil
 		}
 		narration := newNarrationGate(toolMaps)
+		// Same identity scrub as the other streaming branch; without it reasoning
+		// safety depended on which branch happened to run.
+		reasoningFilter := newPublicReasoningStreamFilter()
 		onDelta := func(content string) error {
 			// This branch runs after tool routing already declined to call a tool, so
 			// narration here leads nowhere and must not reach the client.
@@ -1570,7 +1584,7 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 			return nil
 		}
 		onReasoning := func(reasoning string) error {
-			if reasoning != "" {
+			if reasoning = reasoningFilter.Push(reasoning); reasoning != "" {
 				usage.addCompletion(reasoning)
 				return writeChunk(map[string]any{"reasoning_content": reasoning})
 			}
@@ -1582,6 +1596,12 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 		res, err = s.chat.ChatWithReasoning(ctx, account, answerReq, onDelta, onReasoning)
 		if err == nil {
 			s.accountPool.MarkSuccess(acc.ID)
+			// Release the reasoning tail the filter withheld for cross-chunk
+			// leak detection.
+			if tail := reasoningFilter.Flush(); tail != "" {
+				usage.addCompletion(tail)
+				_ = writeChunk(map[string]any{"reasoning_content": tail})
+			}
 			if held, narrated := narration.Close(); held != "" {
 				if narrated {
 					log.Printf("[req-trace] id=%s stage=stream_narration_withheld text=%q", requestID, held)
@@ -1695,7 +1715,7 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 				calls = limitToolCalls(calls, adaptiveToolCallLimit(calls, configuredToolCallLimit(s.settings)))
 				// The call was recovered from res.Text, the model's own prose, so
 				// that prose is the preamble. routeRes only carried the decision.
-				_ = writeToolResponse(w, toolResponse{ID: id, Model: model, Stream: body.Stream, Calls: calls, Result: routeRes, Preamble: toolPreamble(res.Text, toolMaps), Prompt: prompt, Options: body.StreamOptions})
+				_ = writeToolResponse(w, toolResponse{ID: id, Model: model, Stream: body.Stream, Calls: calls, Result: routerToolResult(routeRes), Preamble: toolPreamble(res.Text, toolMaps), Prompt: prompt, Options: body.StreamOptions})
 				return
 			}
 		}
@@ -1765,8 +1785,10 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 		"role":    "assistant",
 		"content": content,
 	}
-	if res.Reasoning != "" {
-		assistant["reasoning_content"] = res.Reasoning
+	// Reasoning is upstream chain-of-thought, so it goes through the identity
+	// scrub before it becomes a client-visible field.
+	if reasoning := sanitizePublicReasoningText(res.Reasoning); reasoning != "" {
+		assistant["reasoning_content"] = reasoning
 	}
 	// 上游 ChatHub 不返回 token 计数，按请求/回复文本本地估算填充
 	// OpenAI 要求的 usage 字段。
