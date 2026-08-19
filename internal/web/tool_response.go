@@ -97,7 +97,9 @@ func writeToolResponse(w http.ResponseWriter, args ...any) error {
 		msg["content"] = t.Preamble
 	}
 	if reasoning := sanitizePublicReasoningText(t.Result.Reasoning); reasoning != "" {
-		msg["reasoning_content"] = reasoning
+		for key, value := range reasoningFields(reasoning) {
+			msg[key] = value
+		}
 	}
 	created := time.Now().Unix()
 	if t.Stream {
@@ -119,7 +121,9 @@ func writeToolResponse(w http.ResponseWriter, args ...any) error {
 			firstDelta["content"] = t.Preamble
 		}
 		if reasoning := sanitizePublicReasoningText(t.Result.Reasoning); reasoning != "" {
-			firstDelta["reasoning_content"] = reasoning
+			for key, value := range reasoningFields(reasoning) {
+				firstDelta[key] = value
+			}
 		}
 		emit(base(firstDelta, nil))
 		for i, tc := range t.Calls {

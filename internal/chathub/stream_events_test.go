@@ -76,9 +76,11 @@ func TestClassifyChainOfThoughtAsReasoning(t *testing.T) {
 	got := classifyUpdateMessages([]any{
 		map[string]any{"author": "bot", "text": "**搜索用户需求**\n- 查询相关文档", "messageType": "Progress", "contentOrigin": "ChainOfThoughtSummary"},
 		map[string]any{"author": "bot", "text": "使用工具查找", "messageType": "Progress", "addToChainOfThought": true},
+		map[string]any{"author": "bot", "text": "字符串标记", "messageType": "Progress", "addToChainOfThought": "true"},
+		map[string]any{"author": "bot", "text": "新推理来源", "messageType": "Progress", "contentOrigin": "ReasoningSummary"},
 		map[string]any{"author": "bot", "text": "普通进度", "messageType": "Progress", "contentOrigin": "SomeOtherOrigin"},
 	})
-	if len(got) != 3 {
+	if len(got) != 5 {
 		t.Fatalf("unexpected event count: %#v", got)
 	}
 	if got[0].Kind != "reasoning" || got[0].Text == "" {
@@ -87,8 +89,11 @@ func TestClassifyChainOfThoughtAsReasoning(t *testing.T) {
 	if got[1].Kind != "reasoning" {
 		t.Fatalf("expected reasoning via addToChainOfThought, got %#v", got[1])
 	}
-	if got[2].Kind != "progress" {
-		t.Fatalf("ordinary progress must stay progress, got %#v", got[2])
+	if got[2].Kind != "reasoning" || got[3].Kind != "reasoning" {
+		t.Fatalf("alternate reasoning markers were not recognized: %#v", got)
+	}
+	if got[4].Kind != "progress" {
+		t.Fatalf("ordinary progress must stay progress, got %#v", got[4])
 	}
 }
 

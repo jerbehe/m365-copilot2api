@@ -1226,7 +1226,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			s.dropTransientConversation(routeRes.ConversationID)
 		}
 		if routeErr != nil {
-			http.Error(w, "tool router: "+routeErr.Error(), http.StatusBadGateway)
+			writeUpstreamError(w, routeErr)
 			return
 		}
 		calls, parsed := parseModelToolDecision(routeRes.Text, routeMaps, body.ToolChoice)
@@ -1328,7 +1328,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			}
 			// Reasoning counts toward completion tokens: the client received it.
 			usage.addCompletion(part)
-			return writeDelta(map[string]any{"reasoning_content": part})
+			return writeDelta(reasoningFields(part))
 		}
 		flushReasoning := func() error {
 			part := reasoningFilter.Flush()
@@ -1336,7 +1336,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 				return nil
 			}
 			usage.addCompletion(part)
-			return writeDelta(map[string]any{"reasoning_content": part})
+			return writeDelta(reasoningFields(part))
 		}
 		res, err := s.chat.ChatWithEvents(ctx, account, answerReq, func(ev chathub.StreamEvent) error {
 			if ev.Kind == "tool" && ev.ToolName != "" && len(ev.Arguments) > 0 {
@@ -1482,7 +1482,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		routePrompt := modelToolRouterPrompt(prompt+"\n"+ledger.RouterContext(), routeMaps, body.ToolChoice)
 		routeRes, routeErr := s.chat.Chat(ctx, account, chathub.Request{Text: routePrompt, Tone: tone, Attachments: body.Attachments})
 		if routeErr != nil {
-			http.Error(w, "tool router: "+routeErr.Error(), http.StatusBadGateway)
+			writeUpstreamError(w, routeErr)
 			return
 		}
 		calls, parsed := parseModelToolDecision(routeRes.Text, routeMaps, body.ToolChoice)
@@ -1586,7 +1586,7 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 		onReasoning := func(reasoning string) error {
 			if reasoning = reasoningFilter.Push(reasoning); reasoning != "" {
 				usage.addCompletion(reasoning)
-				return writeChunk(map[string]any{"reasoning_content": reasoning})
+				return writeChunk(reasoningFields(reasoning))
 			}
 			return nil
 		}
@@ -1594,14 +1594,15 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 			return
 		}
 		res, err = s.chat.ChatWithReasoning(ctx, account, answerReq, onDelta, onReasoning)
+		// Always release buffered reasoning before writing either the normal
+		// completion or an upstream error. Otherwise an interrupted stream loses
+		// its final reasoning fragment.
+		if tail := reasoningFilter.Flush(); tail != "" {
+			usage.addCompletion(tail)
+			_ = writeChunk(reasoningFields(tail))
+		}
 		if err == nil {
 			s.accountPool.MarkSuccess(acc.ID)
-			// Release the reasoning tail the filter withheld for cross-chunk
-			// leak detection.
-			if tail := reasoningFilter.Flush(); tail != "" {
-				usage.addCompletion(tail)
-				_ = writeChunk(map[string]any{"reasoning_content": tail})
-			}
 			if held, narrated := narration.Close(); held != "" {
 				if narrated {
 					log.Printf("[req-trace] id=%s stage=stream_narration_withheld text=%q", requestID, held)
@@ -1788,7 +1789,9 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 	// Reasoning is upstream chain-of-thought, so it goes through the identity
 	// scrub before it becomes a client-visible field.
 	if reasoning := sanitizePublicReasoningText(res.Reasoning); reasoning != "" {
-		assistant["reasoning_content"] = reasoning
+		for key, value := range reasoningFields(reasoning) {
+			assistant[key] = value
+		}
 	}
 	// 上游 ChatHub 不返回 token 计数，按请求/回复文本本地估算填充
 	// OpenAI 要求的 usage 字段。

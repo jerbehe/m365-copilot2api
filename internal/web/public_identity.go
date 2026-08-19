@@ -336,6 +336,9 @@ func sanitizePublicAssistantMessage(message map[string]any, models ...string) {
 	if reasoning, ok := message["reasoning_content"].(string); ok {
 		message["reasoning_content"] = sanitizePublicReasoningText(reasoning)
 	}
+	if reasoning, ok := message["agent_reasoning"].(string); ok {
+		message["agent_reasoning"] = sanitizePublicReasoningText(reasoning)
+	}
 	switch content := message["content"].(type) {
 	case string:
 		message["content"] = sanitizePublicAssistantTextForModel(content, model)
@@ -393,7 +396,7 @@ func sanitizePublicJSONValue(value any) any {
 		return v
 	case map[string]any:
 		for key, item := range v {
-			if strings.EqualFold(key, "reasoning_content") || strings.EqualFold(key, "reasoning") {
+			if strings.EqualFold(key, "reasoning_content") || strings.EqualFold(key, "agent_reasoning") || strings.EqualFold(key, "reasoning") {
 				if reasoning, ok := item.(string); ok {
 					v[key] = sanitizePublicReasoningText(reasoning)
 					continue

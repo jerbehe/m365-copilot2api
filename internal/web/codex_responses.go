@@ -146,7 +146,7 @@ func assistantMessageItem(id, text, phase string) map[string]any {
 // first of all — clients attach later deltas to the most recently added item.
 func responsesOutputItems(msg map[string]any) []any {
 	var output []any
-	if reasoning, _ := msg["reasoning_content"].(string); strings.TrimSpace(reasoning) != "" {
+	if reasoning := reasoningText(msg); strings.TrimSpace(reasoning) != "" {
 		output = append(output, reasoningOutputItem("rs_"+uuid.NewString(), reasoning))
 	}
 	calls, _ := msg["tool_calls"].([]any)

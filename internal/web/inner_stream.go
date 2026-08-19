@@ -115,7 +115,7 @@ func dispatchInnerStream(r io.Reader, h innerStreamHandler, plain *strings.Build
 		}
 		choice, _ := choices[0].(map[string]any)
 		delta, _ := choice["delta"].(map[string]any)
-		if v, ok := delta["reasoning_content"].(string); ok && v != "" && h.Reasoning != nil {
+		if v := reasoningText(delta); v != "" && h.Reasoning != nil {
 			if err := h.Reasoning(v); err != nil {
 				return err
 			}

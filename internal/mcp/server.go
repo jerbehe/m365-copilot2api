@@ -32,6 +32,27 @@ func (r *toolRegistry) RegisterTools(tools []Tool) {
 	r.tools = append([]Tool(nil), tools...)
 }
 
+// MergeTools adds new tools and refreshes existing definitions by name.
+func (r *toolRegistry) MergeTools(tools []Tool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	index := make(map[string]int, len(r.tools))
+	for i, tool := range r.tools {
+		index[tool.Name] = i
+	}
+	for _, tool := range tools {
+		if tool.Name == "" {
+			continue
+		}
+		if i, ok := index[tool.Name]; ok {
+			r.tools[i] = tool
+			continue
+		}
+		index[tool.Name] = len(r.tools)
+		r.tools = append(r.tools, tool)
+	}
+}
+
 // ListTools returns the currently registered tools.
 func (r *toolRegistry) ListTools() []Tool {
 	r.mu.RLock()
@@ -67,12 +88,12 @@ type sessionRegistry struct {
 }
 
 type session struct {
-	id       string
+	id         string
 	providerMu sync.RWMutex
-	provider ToolProvider
-	created  time.Time
-	msgCh    chan json.RawMessage
-	done     chan struct{}
+	provider   ToolProvider
+	created    time.Time
+	msgCh      chan json.RawMessage
+	done       chan struct{}
 }
 
 // RegisterSession creates a new MCP session with the given tool provider and returns the session ID.

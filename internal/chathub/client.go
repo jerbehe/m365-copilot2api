@@ -260,6 +260,7 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 	var events []json.RawMessage
 	seenStreamTools := map[string]bool{}
 	var reasoningBuf strings.Builder
+	lastReasoningSnapshot := ""
 
 	// Upstream rate limiting can surface as a human-readable notice on the
 	// text channel instead of an HTTP 429. Detect it before any real content
@@ -343,6 +344,16 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 
 					for _, ev := range classifyUpdateMessages(msgs) {
 						if ev.Kind == "reasoning" {
+							// Reasoning cards are frequently resent as complete snapshots.
+							// Forward only the unseen suffix so clients do not receive
+							// duplicated or apparently reset reasoning content.
+							if ev.Text == lastReasoningSnapshot {
+								continue
+							}
+							if strings.HasPrefix(ev.Text, lastReasoningSnapshot) {
+								ev.Text = strings.TrimPrefix(ev.Text, lastReasoningSnapshot)
+							}
+							lastReasoningSnapshot += ev.Text
 							reasoningBuf.WriteString(ev.Text)
 						}
 						ev.Raw = eventRaw(arg)

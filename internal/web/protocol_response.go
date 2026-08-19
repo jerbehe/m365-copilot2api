@@ -41,7 +41,7 @@ func writeAnthropicResultUsage(w http.ResponseWriter, model string, stream bool,
 	}
 	blocks := []any{}
 	stop := "end_turn"
-	if reasoning, _ := msg["reasoning_content"].(string); reasoning != "" {
+	if reasoning := reasoningText(msg); reasoning != "" {
 		blocks = append(blocks, map[string]any{"type": "thinking", "thinking": reasoning, "signature": ""})
 	}
 	// Text comes before the calls, and both are emitted: a turn that narrates and

@@ -18,7 +18,7 @@ func classifyUpdateMessages(messages []any) []StreamEvent {
 		mt, _ := m["messageType"].(string)
 		ct, _ := m["contentType"].(string)
 		origin, _ := m["contentOrigin"].(string)
-		cot, _ := m["addToChainOfThought"].(bool)
+		cot := truthy(m["addToChainOfThought"])
 		kind := "text"
 		if mt == "Progress" || ct == "Code" || ct == "ToolCall" {
 			kind = "progress"
@@ -34,7 +34,8 @@ func classifyUpdateMessages(messages []any) []StreamEvent {
 		// ChatHub marks the multi-step reasoning transcript (ChainOfThought cards)
 		// via contentOrigin and addToChainOfThought. Expose it separately so the
 		// OpenAI-compatible layer can render it as reasoning_content.
-		if origin == "ChainOfThoughtSummary" || cot {
+		if strings.Contains(strings.ToLower(origin), "chainofthought") ||
+			strings.Contains(strings.ToLower(origin), "reasoning") || cot {
 			kind = "reasoning"
 		}
 		name, args := extractToolFields(m)
@@ -47,6 +48,20 @@ func classifyUpdateMessages(messages []any) []StreamEvent {
 		out = append(out, StreamEvent{Kind: kind, Text: text, MessageType: mt, ContentType: ct, ToolName: name, Arguments: args})
 	}
 	return out
+}
+
+func truthy(v any) bool {
+	switch value := v.(type) {
+	case bool:
+		return value
+	case string:
+		value = strings.TrimSpace(strings.ToLower(value))
+		return value == "true" || value == "1" || value == "yes"
+	case float64:
+		return value != 0
+	default:
+		return false
+	}
 }
 
 func extractToolFields(m map[string]any) (string, json.RawMessage) {

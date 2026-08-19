@@ -27,6 +27,7 @@ type agentLedger struct {
 	RepeatedCall        bool           `json:"repeated_call"`
 	RepeatedFailure     bool           `json:"repeated_failure"`
 	RepetitionSignature string         `json:"repetition_signature,omitempty"`
+	StuckLoop           bool           `json:"stuck_loop"`
 }
 
 var failureSignal = regexp.MustCompile(`(?i)(exit\s*(code|status)?\s*[:=]?\s*[1-9]\d*|\berror\b|\bfailed\b|\bfailure\b|exception|traceback|timed?\s*out|permission denied|not found|refused)`)
@@ -92,6 +93,9 @@ func buildAgentLedger(messages []oaiMsg) agentLedger {
 			l.RepeatedCall = true
 			l.RepetitionSignature = sig
 		}
+		if seenCall[sig] >= 3 {
+			l.StuckLoop = true
+		}
 		if e.Result == "" {
 			l.Pending = append(l.Pending, e)
 		} else {
@@ -102,6 +106,9 @@ func buildAgentLedger(messages []oaiMsg) agentLedger {
 				if seenFailure[fs] >= 2 {
 					l.RepeatedFailure = true
 					l.RepetitionSignature = fs
+				}
+				if seenFailure[fs] >= 3 {
+					l.StuckLoop = true
 				}
 			}
 		}
@@ -194,6 +201,12 @@ func (l agentLedger) CanContinue(maxRounds int) error {
 	}
 	if l.ToolRounds >= maxRounds {
 		return fmt.Errorf("tool round limit reached: %d", maxRounds)
+	}
+	if l.StuckLoop {
+		return fmt.Errorf("stuck tool loop detected: same call repeated 3+ times")
+	}
+	if l.RepeatedFailure {
+		return fmt.Errorf("repeated tool failure detected: %s", l.RepetitionSignature)
 	}
 	if len(l.Pending) > 0 {
 		return fmt.Errorf("pending tool results must be returned before another turn")
