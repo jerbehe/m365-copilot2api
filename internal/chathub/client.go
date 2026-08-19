@@ -11,6 +11,7 @@ import (
 	"m365-copilot2api/internal/outbound"
 	"net/http"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -19,19 +20,23 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-func minInt(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
+// ErrRateLimitNotice (declared in events.go) identifies the human-readable
+// rate-limit response that ChatHub sometimes sends through the text channel
+// instead of HTTP 429. Callers must independently probe the account before
+// marking it unhealthy.
 
-// ErrEmptyCompletion marks an upstream turn that finished without producing
-// any text; the tone may be unavailable for this tenant.
 var ErrEmptyCompletion = errors.New("upstream returned empty completion; tone may be unavailable for this tenant")
 
-// DialError carries the HTTP status and optional Retry-After from a failed
-// WebSocket dial so the web layer can route it into the correct cooldown.
+var ErrMeteringOutOfCredits = errors.New("upstream metering out of credits")
+
+var ErrContentPolicyBlocked = errors.New("upstream content policy blocked")
+
+type ThrottlingInfo struct {
+	Raw             json.RawMessage
+	MaxTurnCount    int
+	MeteringCredits any
+}
+
 type DialError struct {
 	Status     int
 	RetryAfter int
@@ -39,6 +44,22 @@ type DialError struct {
 
 func (e *DialError) Error() string {
 	return fmt.Sprintf("ws dial: upstream %d", e.Status)
+}
+
+var chTrace = os.Getenv("M365_TRACE") == "1"
+
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "..."
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 const (
@@ -94,7 +115,7 @@ type Result struct {
 	ConversationID string
 	SessionID      string
 	RequestID      string
-	Throttling     any
+	Throttling     *ThrottlingInfo
 	RawResult      string
 	Events         []json.RawMessage
 	Normalized     []Event
@@ -105,18 +126,20 @@ type Client struct {
 	HTTPHeader http.Header
 	HTTPClient *http.Client
 	Dialer     *websocket.Dialer
-	// Trace receives attachment-only metadata; URL contents are never exposed.
-	Trace func(map[string]any)
+	Pool       *ConnPool
+	Trace      func(map[string]any)
 }
 
 func NewClient() *Client {
 	h := make(http.Header)
 	h.Set("Origin", "https://m365.cloud.microsoft")
 	h.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:148.0) Gecko/20100101 Firefox/148.0")
+	d := outbound.WebSocketDialer()
 	return &Client{
 		HTTPHeader: h,
 		HTTPClient: outbound.HTTPClient(),
-		Dialer:     outbound.WebSocketDialer(),
+		Dialer:     d,
+		Pool:       NewConnPool(d, h),
 	}
 }
 
@@ -180,39 +203,72 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 		firstTurn = true
 	}
 	requestID := uuid.NewString()
-	if err := c.uploadAttachments(ctx, acc, req.ConversationID, req.Attachments); err != nil {
-		return Result{}, fmt.Errorf("upload attachment: %w", err)
-	}
-
 	wsURL, err := buildWSURL(acc, req.SessionID, req.ConversationID, requestID)
 	if err != nil {
 		return Result{}, err
 	}
+	attachCh := make(chan error, 1)
+	if len(req.Attachments) > 0 {
+		go func() { attachCh <- c.uploadAttachments(ctx, acc, req.ConversationID, req.Attachments) }()
+	}
 
 	dialStarted := time.Now()
-	conn, resp, err := c.Dialer.DialContext(ctx, wsURL, c.HTTPHeader.Clone())
-	log.Printf("chathub timing ws_dial_ms=%d total_ms=%d", time.Since(dialStarted).Milliseconds(), time.Since(startedAt).Milliseconds())
-	if err != nil {
-		if resp != nil && (resp.StatusCode == 429 || resp.StatusCode == 401 || resp.StatusCode == 403) {
-			retryAfter := 0
-			if v, _ := strconv.Atoi(resp.Header.Get("Retry-After")); v > 0 {
-				retryAfter = v
-			}
-			log.Printf("chathub ws_dial %d Retry-After=%d", resp.StatusCode, retryAfter)
-			return Result{}, &DialError{Status: resp.StatusCode, RetryAfter: retryAfter}
+	var conn *websocket.Conn
+	var reused bool
+	if c.Pool != nil {
+		var poolErr error
+		conn, reused, poolErr = c.Pool.Take(ctx, acc.OID, acc.TID, wsURL)
+		if poolErr != nil {
+			return Result{}, fmt.Errorf("ws dial: %w", poolErr)
 		}
-		return Result{}, fmt.Errorf("ws dial: %w", err)
 	}
-	defer conn.Close()
+	if conn == nil {
+		var resp *http.Response
+		conn, resp, err = c.Dialer.DialContext(ctx, wsURL, c.HTTPHeader.Clone())
+		if err != nil {
+			if resp != nil && (resp.StatusCode == 429 || resp.StatusCode == 401 || resp.StatusCode == 403) {
+				retryAfter := 0
+				if v, _ := strconv.Atoi(resp.Header.Get("Retry-After")); v > 0 {
+					retryAfter = v
+				}
+				log.Printf("chathub ws_dial %d Retry-After=%d", resp.StatusCode, retryAfter)
+				return Result{}, &DialError{Status: resp.StatusCode, RetryAfter: retryAfter}
+			}
+			return Result{}, fmt.Errorf("ws dial: %w", err)
+		}
+	}
+	log.Printf("chathub timing ws_dial_ms=%d total_ms=%d reused=%t", time.Since(dialStarted).Milliseconds(), time.Since(startedAt).Milliseconds(), reused)
+
+	returnConn := true
+	defer func() {
+		if returnConn && conn != nil && c.Pool != nil {
+			_ = conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+			_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			c.Pool.Return(acc.OID, acc.TID, conn)
+		} else if conn != nil {
+			conn.Close()
+		}
+	}()
+
+	if len(req.Attachments) > 0 {
+		if attachErr := <-attachCh; attachErr != nil {
+			returnConn = false
+			return Result{}, fmt.Errorf("upload attachment: %w", attachErr)
+		}
+	}
 
 	_ = conn.SetReadDeadline(time.Now().Add(45 * time.Second))
 	_ = conn.SetWriteDeadline(time.Now().Add(15 * time.Second))
 
-	if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"protocol":"json","version":1}`+rs)); err != nil {
-		return Result{}, fmt.Errorf("handshake send: %w", err)
-	}
-	if _, _, err := conn.ReadMessage(); err != nil {
-		return Result{}, fmt.Errorf("handshake recv: %w", err)
+	if !reused {
+		if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"protocol":"json","version":1}`+rs)); err != nil {
+			returnConn = false
+			return Result{}, fmt.Errorf("handshake send: %w", err)
+		}
+		if _, _, err := conn.ReadMessage(); err != nil {
+			returnConn = false
+			return Result{}, fmt.Errorf("handshake recv: %w", err)
+		}
 	}
 
 	payload := chatPayload(req.Text, req.SessionID, req.ConversationID, requestID, req.Tone, firstTurn, req.Attachments, req.Tools, req.ToolChoice, req.MCPServerURL)
@@ -227,46 +283,40 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 	log.Printf("chathub timing handshake_ms=%d", time.Since(dialStarted).Milliseconds())
 	payloadSentAt := time.Now()
 	if err := conn.WriteMessage(websocket.TextMessage, []byte(payload)); err != nil {
+		returnConn = false
 		return Result{}, fmt.Errorf("chat send: %w", err)
 	}
 
-	var answer answerBuffer
-	firstForward := true
-	forward := func(d string) error {
+	var deltas []string
+	var streamed strings.Builder
+	emitDelta := func(d string) error {
 		if d == "" {
 			return nil
 		}
-		if firstForward {
-			firstForward = false
+		if chTrace {
+			log.Printf("[trace:emitDelta] len=%d streamed=%d preview=%q", len(d), streamed.Len()+len(d), truncate(d, 80))
+		}
+		if streamed.Len() == 0 {
 			log.Printf("chathub timing first_delta_ms=%d len=%d", time.Since(payloadSentAt).Milliseconds(), len(d))
 		}
+		streamed.WriteString(d)
+		deltas = append(deltas, d)
 		if onDelta != nil {
 			return onDelta(d)
 		}
 		return nil
 	}
-	cursorFrames, snapshotFrames := 0, 0
-	emitDelta := func(chunk string) error {
-		cursorFrames++
-		return forward(answer.Append(chunk))
-	}
-	emitSnapshot := func(snapshot string) error {
-		snapshotFrames++
-		return forward(answer.Replace(snapshot))
-	}
-	var final string
-	var throttling any
-	var rawResult string
-	var events []json.RawMessage
-	seenStreamTools := map[string]bool{}
-	var reasoningBuf strings.Builder
-	lastReasoningSnapshot := ""
-
-	// Upstream rate limiting can surface as a human-readable notice on the
-	// text channel instead of an HTTP 429. Detect it before any real content
-	// has streamed so the web layer can fail over rather than answer with it.
+	// ChatHub signals text either as a full snapshot or as cursor rewrites.
+	// Only the portion not already streamed may be emitted; naive prefix
+	// checks misfire when upstream rewrites the whole buffer, which duplicated
+	// answers (AAA…). Match any overlap and emit the tail.
+	// Upstream rate limiting surfaces as a human-readable notice on the text
+	// channel instead of an HTTP 429. Detect it before any real content has
+	// streamed so the web layer can fail over rather than answer with it.
+	// The "throttling" frame itself is per-conversation quota metadata and is
+	// NOT a rate-limit signal.
 	rateLimited := func(text string) bool {
-		if answer.Emitted() != 0 {
+		if streamed.Len() != 0 {
 			return false
 		}
 		t := strings.ToLower(text)
@@ -274,8 +324,88 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 			strings.Contains(t, "太多请求") ||
 			strings.Contains(t, "无法响应这么多请求") ||
 			strings.Contains(t, "too many requests") ||
-			strings.Contains(t, "please retry") && strings.Contains(t, "later")
+			strings.Contains(t, "please retry") && strings.Contains(t, "later") ||
+			strings.Contains(t, "customthrottlereply") ||
+			strings.Contains(t, "customlimitthrottlereply") ||
+			strings.Contains(t, "meteringoutofcredits")
 	}
+	meteringOutOfCredits := func(text string) bool {
+		return strings.Contains(strings.ToLower(text), "meteringoutofcredits")
+	}
+	contentPolicyBlocked := func(text string) bool {
+		if len(text) > 300 {
+			return false
+		}
+		tl := strings.ToLower(text)
+		return (strings.Contains(tl, "content policy") && strings.Contains(tl, "block")) ||
+			strings.Contains(tl, "i'm sorry, i can't respond") ||
+			strings.Contains(tl, "i'm sorry, i cannot respond") ||
+			strings.Contains(tl, "很抱歉，我无法响应") ||
+			strings.Contains(tl, "我很抱歉，我无法响应") ||
+			strings.Contains(tl, "contentfilter") ||
+			strings.Contains(tl, "safetyblocked")
+	}
+	parseThrottling := func(raw any) *ThrottlingInfo {
+		if raw == nil {
+			return nil
+		}
+		b, err := json.Marshal(raw)
+		if err != nil {
+			return nil
+		}
+		info := &ThrottlingInfo{Raw: json.RawMessage(b)}
+		var m map[string]any
+		if json.Unmarshal(b, &m) == nil {
+			if v, ok := m["maxTurnCount"]; ok {
+				if f, ok := v.(float64); ok {
+					info.MaxTurnCount = int(f)
+				}
+			}
+			if _, ok := m["meteringInformation"]; ok {
+				info.MeteringCredits = m["meteringInformation"]
+			}
+			if _, ok := m["remainingAllowance"]; ok {
+				info.MeteringCredits = m["remainingAllowance"]
+			}
+		}
+		return info
+	}
+	emitSnapshot := func(snapshot string) error {
+		if snapshot == "" {
+			return nil
+		}
+		if chTrace {
+			log.Printf("[trace:emitSnapshot] cur=%d snapshot=%d", streamed.Len(), len(snapshot))
+		}
+		if rateLimited(snapshot) {
+			if meteringOutOfCredits(snapshot) {
+				return ErrMeteringOutOfCredits
+			}
+			return ErrRateLimitNotice
+		}
+		if contentPolicyBlocked(snapshot) {
+			return ErrContentPolicyBlocked
+		}
+		cur := streamed.String()
+		if cur == "" {
+			return emitDelta(snapshot)
+		}
+		if strings.HasPrefix(snapshot, cur) {
+			return emitDelta(snapshot[len(cur):])
+		}
+		if len(snapshot) <= len(cur) {
+			return nil
+		}
+		log.Printf("[emitSnapshot] skip: cur=%d snapshot=%d (non-prefix rewrite)", len(cur), len(snapshot))
+		return nil
+	}
+	var final string
+	var throttlingInfo *ThrottlingInfo
+	var rawResult string
+	var events []json.RawMessage
+	seenStreamTools := map[string]bool{}
+	var reasoningBuf strings.Builder
+	lastReasoningSnapshot := ""
 
 	deadline := time.Now().Add(5 * time.Minute)
 	type wsRead struct {
@@ -293,10 +423,12 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 		var read wsRead
 		select {
 		case <-ctx.Done():
+			returnConn = false
 			return Result{}, ctx.Err()
 		case read = <-readCh:
 		}
 		if read.err != nil {
+			returnConn = false
 			// Never convert a timeout or dropped WebSocket into a successful
 			// partial response. A response is complete only after SignalR type 3.
 			return Result{}, fmt.Errorf("ws read before completion: %w", read.err)
@@ -306,9 +438,13 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 			if part == "" {
 				continue
 			}
-			events = append(events, json.RawMessage(append([]byte(nil), part...)))
+			if chTrace {
+				log.Printf("[trace:ws] frame_len=%d preview=%q", len(part), truncate(part, 120))
+			}
+			b := []byte(part)
+			events = append(events, json.RawMessage(b))
 			var obj map[string]any
-			if err := json.Unmarshal([]byte(part), &obj); err != nil {
+			if err := json.Unmarshal(b, &obj); err != nil {
 				continue
 			}
 			t, _ := obj["type"].(float64)
@@ -337,6 +473,7 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 					if onEvent != nil {
 						for _, ev := range extractToolEvents(arg, seenStreamTools) {
 							if err := onEvent(ev); err != nil {
+								returnConn = false
 								return Result{}, err
 							}
 						}
@@ -361,6 +498,7 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 						// handlers even though they are classified as text.
 						if (ev.Kind != "text" || ev.ContentType == "SearchResults") && onEvent != nil {
 							if err := onEvent(ev); err != nil {
+								returnConn = false
 								return Result{}, err
 							}
 						}
@@ -374,13 +512,14 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 							toolFrame = true
 						}
 					}
+					if thr, ok := arg["throttling"]; ok {
+						throttlingInfo = parseThrottling(thr)
+					}
 					if w, ok := arg["writeAtCursor"].(string); ok && w != "" && !toolFrame {
 						if err := emitDelta(w); err != nil {
+							returnConn = false
 							return Result{}, err
 						}
-					}
-					if thr, ok := arg["throttling"]; ok {
-						throttling = thr
 					}
 					if msgs, ok := arg["messages"].([]any); ok {
 						for _, mraw := range msgs {
@@ -394,10 +533,8 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 							if author == "bot" && mt == "" && text != "" {
 								// ChatHub often sends the first visible text as a full snapshot,
 								// followed by cursor deltas. Emit only the unseen suffix.
-								if rateLimited(text) {
-									return Result{}, ErrRateLimitNotice
-								}
 								if err := emitSnapshot(text); err != nil {
+									returnConn = false
 									return Result{}, err
 								}
 							}
@@ -411,14 +548,23 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 				item, _ := obj["item"].(map[string]any)
 				if item != nil {
 					if thr, ok := item["throttling"]; ok {
-						throttling = thr
+						throttlingInfo = parseThrottling(thr)
 					}
 					if res, ok := item["result"].(map[string]any); ok {
 						rawResult, _ = res["value"].(string)
 						if msg, ok := res["message"].(string); ok {
 							final = msg
+							if meteringOutOfCredits(final) {
+								returnConn = false
+								return Result{}, ErrMeteringOutOfCredits
+							}
 							if rateLimited(final) {
+								returnConn = false
 								return Result{}, ErrRateLimitNotice
+							}
+							if contentPolicyBlocked(final) {
+								returnConn = false
+								return Result{}, ErrContentPolicyBlocked
 							}
 						}
 					}
@@ -429,23 +575,30 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 
 			if int(t) == 3 {
 				if errObj, ok := obj["error"].(map[string]any); ok {
+					returnConn = false
 					return Result{}, fmt.Errorf("chathub completion error: %v", errObj)
 				}
-				// Release whatever is still buffered: the answer is final, so no
-				// further rewrite can arrive.
-				if err := forward(answer.Flush()); err != nil {
-					return Result{}, err
-				}
-				// end of stream
-				log.Printf("chathub timing completion_frame_ms=%d streamed_text=%d emitted=%d cursor_frames=%d snapshot_frames=%d events=%d", time.Since(payloadSentAt).Milliseconds(), len(answer.Text()), answer.Emitted(), cursorFrames, snapshotFrames, len(events))
-				text := final
+				log.Printf("chathub timing completion_frame_ms=%d streamed_text=%d events=%d", time.Since(payloadSentAt).Milliseconds(), streamed.Len(), len(events))
+				text := streamed.String()
 				if text == "" {
-					text = answer.Text()
+					text = final
+				}
+				if text == "" {
+					text = strings.Join(deltas, "")
 				}
 				if rateLimited(text) {
+					returnConn = false
+					if meteringOutOfCredits(text) {
+						return Result{}, ErrMeteringOutOfCredits
+					}
 					return Result{}, ErrRateLimitNotice
 				}
+				if contentPolicyBlocked(text) {
+					returnConn = false
+					return Result{}, ErrContentPolicyBlocked
+				}
 				if text == "" {
+					returnConn = false
 					return Result{}, ErrEmptyCompletion
 				}
 				return Result{
@@ -454,7 +607,7 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 					ConversationID: req.ConversationID,
 					SessionID:      req.SessionID,
 					RequestID:      requestID,
-					Throttling:     throttling,
+					Throttling:     throttlingInfo,
 					RawResult:      rawResult,
 					Events:         events,
 					Normalized:     NormalizeEvents(events),
@@ -467,6 +620,7 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 	// Reaching the overall deadline without a SignalR completion frame is
 	// an incomplete upstream response. Do not return accumulated deltas as if
 	// they were a successful, finished answer.
+	returnConn = false
 	return Result{}, fmt.Errorf("chathub response deadline exceeded before completion")
 }
 
@@ -668,8 +822,7 @@ func (c *Client) uploadAttachments(ctx context.Context, acc Account, conversatio
 }
 
 func chatPayload(text, sessionID, conversationID, requestID, tone string, firstTurn bool, attachments []Attachment, tools []Tool, toolChoice any, mcpServerURL string) string {
-	plugins := clientPlugins(tools, mcpServerURL)
-	text = toolProtocolPrompt(text, tools, toolChoice, len(plugins) > 0)
+	text = toolProtocolPrompt(text, tools, toolChoice, len(clientPlugins(tools, mcpServerURL)) > 0)
 	message := map[string]any{
 		"author":                "user",
 		"attachments":           attachments,
@@ -738,15 +891,15 @@ func chatPayload(text, sessionID, conversationID, requestID, tone string, firstT
 		"update_textdoc_response_after_streaming",
 		"deepleo_networking_timeout_10minutes_canmore",
 		"cwc_flux_image",
+		"cwcfluxgptv",
 		"cwc_code_interpreter",
 		"cwc_code_interpreter_amsfix",
-		"cwcfluxgptv",
-		"flux_v3_gptv_enable_upload_multi_image_in_turn_wo_ch",
-		"gptvnorm2048",
 		"cwc_code_interpreter_citation_fix",
 		"code_interpreter_interactive_charts_inline_image",
 		"code_interpreter_matplotlib_patching",
 		"code_interpreter_interactive_charts",
+		"flux_v3_gptv_enable_upload_multi_image_in_turn_wo_ch",
+		"gptvnorm2048",
 		"cwc_fileupload_odb",
 		"update_memory_plugin",
 		"add_custom_instructions",
@@ -780,7 +933,7 @@ func chatPayload(text, sessionID, conversationID, requestID, tone string, firstT
 				"streamingMode": "ConciseWithPadding",
 				"message":       message,
 
-				"plugins":    plugins,
+				"plugins":    clientPlugins(tools, mcpServerURL),
 				"toolChoice": toolChoice,
 			},
 		},

@@ -91,7 +91,7 @@ func (s *Server) provisionAccount(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !s.validAdminSession(r) {
-		writeOpenAIError(w, http.StatusUnauthorized, "auth_error", "administrator login required")
+		writeOpenAIError(w, http.StatusUnauthorized, "auth_error", "unauthorized", "administrator login required")
 		return
 	}
 	var body struct {
@@ -104,12 +104,12 @@ func (s *Server) provisionAccount(w http.ResponseWriter, r *http.Request) {
 	}
 	set, err := auth.ROPC(body.Email, body.Password)
 	if err != nil {
-		writeOpenAIError(w, http.StatusBadGateway, "ropc_error", err.Error())
+		writeOpenAIError(w, http.StatusBadGateway, "ropc_error", "ropc_failed", err.Error())
 		return
 	}
 	acc, err := s.tokens.Upsert(set)
 	if err != nil {
-		writeOpenAIError(w, http.StatusInternalServerError, "upsert_error", err.Error())
+		writeOpenAIError(w, http.StatusInternalServerError, "upsert_error", "storage_error", err.Error())
 		return
 	}
 	jsonOut(w, map[string]any{"status": "provisioned", "account": map[string]any{

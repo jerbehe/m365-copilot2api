@@ -42,7 +42,7 @@ func TestBuildAnswerRequestNeverCarriesLedger(t *testing.T) {
 	}
 	for name, ledger := range ledgers {
 		for _, mode := range []string{"router", "native"} {
-			req := buildAnswerRequest(prompt, "magic", answerRequestTestBody(), ledger, mode)
+			req := buildAnswerRequest(prompt, "magic", answerRequestTestBody(), ledger, mode, "")
 			if req.Text != prompt {
 				t.Fatalf("ledger=%s mode=%s contaminated answer prompt: %q", name, mode, req.Text)
 			}

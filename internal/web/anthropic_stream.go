@@ -236,7 +236,7 @@ func (s *Server) streamAnthropicMessages(w http.ResponseWriter, r *http.Request,
 		// been emitted yet in that case, so a plain JSON error is still possible and
 		// reports the reason far more clearly than an SSE error frame.
 		if !out.started {
-			writeAnthropicError(w, status, "api_error", message)
+			writeAnthropicError(w, status, "api_error", "upstream_error", message)
 			return
 		}
 		_ = out.Failed(message)
@@ -260,17 +260,17 @@ func (s *Server) streamAnthropicMessages(w http.ResponseWriter, r *http.Request,
 // fall back to a local guess, and a malformed body makes it error out.
 func (s *Server) countAnthropicTokens(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		writeAnthropicError(w, http.StatusMethodNotAllowed, "invalid_request_error", "method not allowed")
+		writeAnthropicError(w, http.StatusMethodNotAllowed, "invalid_request_error", "method_not_allowed", "method not allowed")
 		return
 	}
 	var body anthropicRequest
 	if json.NewDecoder(http.MaxBytesReader(w, r.Body, 32<<20)).Decode(&body) != nil {
-		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", "bad json")
+		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", "invalid_json", "bad json")
 		return
 	}
 	o, err := body.openAI()
 	if err != nil {
-		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", "invalid_parameter", err.Error())
 		return
 	}
 	model := firstNonEmpty(body.Model, "m365-copilot")

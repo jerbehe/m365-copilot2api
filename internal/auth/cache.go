@@ -206,7 +206,9 @@ func (s *Store) Upsert(tok TokenSet) (AccountToken, error) {
 				acc.OID = existing.OID
 			}
 			acc.ScheduleDisabled = existing.ScheduleDisabled
-			acc.BoundProxy = existing.BoundProxy
+			if acc.BoundProxy == "" {
+				acc.BoundProxy = existing.BoundProxy
+			}
 			s.data.Accounts[i] = acc
 			found = true
 			break

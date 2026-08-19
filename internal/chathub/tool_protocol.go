@@ -17,7 +17,7 @@ func toolProtocolPrompt(text string, tools []Tool, choice any, hasPlugins bool) 
 		return fmt.Sprintf("Please answer the following request in full. Do not truncate or abbreviate your response.\n\n%s", text)
 	}
 	if hasPlugins {
-		return fmt.Sprintf("[system] You are operating on the caller's Windows machine. The caller has provided real tools (bash, read, edit, write, glob, grep, etc.) that run locally on Windows PowerShell 5.1. These tools are the ONLY way to execute commands, run code, read files, or interact with the filesystem. Do NOT use any built-in code interpreter, Python sandbox, or cloud execution environment. Do NOT emit ```python or ```code blocks for execution — if you need to run code, use the bash tool. Do NOT mention /mnt/data, Linux containers, cloud sandboxes, or claim the execution environment has changed. Do NOT claim any tool is unavailable. Do NOT output environment diagnostics instead of tool calls. When you decide to use a tool, call it immediately.\n\n%s", text)
+		return text
 	}
 	var defs []string
 	for _, t := range tools {

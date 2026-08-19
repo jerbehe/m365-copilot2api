@@ -35,12 +35,18 @@ func IsRateLimited(err error) bool {
 	}
 	var httpErr *UpstreamHTTPError
 	if errors.As(err, &httpErr) {
-		return httpErr.Status == 429 || httpErr.Status == 503 ||
-			(httpErr.Status == 502 && strings.Contains(strings.ToLower(httpErr.Body), "limited"))
+		if httpErr.Status == 429 || httpErr.Status == 503 {
+			return true
+		}
+		if httpErr.Status != 401 && httpErr.Status != 403 {
+			if strings.Contains(strings.ToLower(httpErr.Body), "limited") {
+				return true
+			}
+		}
 	}
 	var dialErr *chathub.DialError
 	if errors.As(err, &dialErr) {
-		return dialErr.Status == 429 || dialErr.Status == 503
+		return dialErr.Status == 429
 	}
 	msg := strings.ToLower(err.Error())
 	return strings.Contains(msg, "429") ||
@@ -50,8 +56,52 @@ func IsRateLimited(err error) bool {
 		strings.Contains(msg, "limited")
 }
 
-// IsAuthFailure reports whether err represents an upstream 401/403, meaning
-// the account itself is unusable until re-authenticated.
+func IsInsufficientQuota(err error) bool {
+	return errors.Is(err, chathub.ErrMeteringOutOfCredits)
+}
+
+func IsPermissionDenied(err error) bool {
+	if err == nil {
+		return false
+	}
+	var httpErr *UpstreamHTTPError
+	if errors.As(err, &httpErr) {
+		return httpErr.Status == 403
+	}
+	var dialErr *chathub.DialError
+	if errors.As(err, &dialErr) {
+		return dialErr.Status == 403
+	}
+	return false
+}
+
+func IsServerUnavailable(err error) bool {
+	if err == nil {
+		return false
+	}
+	var httpErr *UpstreamHTTPError
+	if errors.As(err, &httpErr) {
+		return httpErr.Status == 503
+	}
+	var dialErr *chathub.DialError
+	if errors.As(err, &dialErr) {
+		return dialErr.Status == 503
+	}
+	return false
+}
+
+func IsTimeout(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "timeout") || strings.Contains(msg, "deadline exceeded")
+}
+
+func IsContentBlocked(err error) bool {
+	return errors.Is(err, chathub.ErrContentPolicyBlocked)
+}
+
 func IsAuthFailure(err error) bool {
 	if err == nil {
 		return false
@@ -95,11 +145,12 @@ type accountHealth struct {
 	mu       sync.Mutex
 	cooldown map[string]time.Time
 	authFail map[string]bool
+	limited  map[string]bool
 	calls    map[string]uint64
 }
 
 func newAccountHealth() *accountHealth {
-	return &accountHealth{cooldown: map[string]time.Time{}, authFail: map[string]bool{}, calls: map[string]uint64{}}
+	return &accountHealth{cooldown: map[string]time.Time{}, authFail: map[string]bool{}, limited: map[string]bool{}, calls: map[string]uint64{}}
 }
 
 func (h *accountHealth) clearExpiredCooldownLocked(accountID string) {
@@ -163,8 +214,43 @@ func (h *accountHealth) MarkFailure(accountID string, err error, window time.Dur
 		h.authFail[accountID] = true
 		return
 	}
+	if IsPermissionDenied(err) {
+		cooldown := window
+		if cooldown > 5*time.Minute {
+			cooldown = 5 * time.Minute
+		}
+		h.cooldown[accountID] = time.Now().Add(cooldown)
+		delete(h.authFail, accountID)
+		delete(h.limited, accountID)
+		return
+	}
 	if IsRateLimited(err) {
 		delete(h.authFail, accountID)
+		h.limited[accountID] = true
+		cd := window
+		if ra := RetryAfterSeconds(err); ra > 0 {
+			cd = time.Duration(ra) * time.Second
+			if cd > time.Hour {
+				cd = time.Hour
+			}
+		}
+		h.cooldown[accountID] = time.Now().Add(cd)
+		return
+	}
+	if IsInsufficientQuota(err) {
+		delete(h.authFail, accountID)
+		h.cooldown[accountID] = time.Now().Add(5 * time.Minute)
+		return
+	}
+	if IsServerUnavailable(err) {
+		cooldown := window
+		if cooldown > 2*time.Minute {
+			cooldown = 2 * time.Minute
+		}
+		h.cooldown[accountID] = time.Now().Add(cooldown)
+		return
+	}
+	if IsTimeout(err) {
 		h.cooldown[accountID] = time.Now().Add(window)
 	}
 }

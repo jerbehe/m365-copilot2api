@@ -1,9 +1,23 @@
 package web
 
 import (
+	"embed"
+	"io/fs"
 	"net/http"
-	"os"
 )
+
+//go:embed all:web
+var webFS embed.FS
+
+var webContent http.FileSystem
+
+func init() {
+	sub, err := fs.Sub(webFS, "web")
+	if err != nil {
+		panic(err)
+	}
+	webContent = http.FS(sub)
+}
 
 func securityHeaders(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -25,16 +39,16 @@ func (s *Server) rootPage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
-		writeOpenAIError(w, http.StatusMethodNotAllowed, "invalid_request_error", "method not allowed")
+		writeOpenAIError(w, http.StatusMethodNotAllowed, "invalid_request_error", "method_not_allowed", "method not allowed")
 		return
 	}
-	name := "web/index.html"
+	name := "index.html"
 	if r.URL.Path == "/login" {
-		name = "web/login.html"
+		name = "login.html"
 	} else if r.URL.Path == "/conversation" {
-		name = "web/conversation.html"
+		name = "conversation.html"
 	}
-	f, err := os.Open(name)
+	f, err := webContent.Open(name)
 	if err != nil {
 		http.Error(w, "web interface unavailable", http.StatusInternalServerError)
 		return

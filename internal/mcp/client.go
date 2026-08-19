@@ -15,7 +15,7 @@ import (
 // Client is an MCP client that connects to an MCP server via HTTP SSE.
 // It implements the MCP client protocol: discover tools, invoke tools.
 type Client struct {
-	serverURL string
+	serverURL  string
 	httpClient *http.Client
 	sessionID  string
 	mu         sync.Mutex
@@ -126,7 +126,7 @@ func (c *Client) Connect(ctx context.Context) error {
 func (c *Client) readSSE(body io.ReadCloser) {
 	defer body.Close()
 	defer c.setConnected(false)
-	
+
 	scanner := bufio.NewScanner(body)
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -217,7 +217,7 @@ func (c *Client) sendRequest(ctx context.Context, method string, params any) err
 	body, _ := json.Marshal(req)
 
 	messageURL := fmt.Sprintf("%s/message?sessionId=%s", strings.TrimRight(strings.Split(c.serverURL, "/sse")[0], "/"), c.sessionID)
-	
+
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, messageURL, strings.NewReader(string(body)))
 	if err != nil {
 		return err
@@ -243,7 +243,7 @@ func (c *Client) sendNotification(method string, params any) error {
 	body, _ := json.Marshal(req)
 
 	messageURL := fmt.Sprintf("%s/message?sessionId=%s", strings.TrimRight(strings.Split(c.serverURL, "/sse")[0], "/"), c.sessionID)
-	
+
 	httpReq, err := http.NewRequest(http.MethodPost, messageURL, strings.NewReader(string(body)))
 	if err != nil {
 		return err

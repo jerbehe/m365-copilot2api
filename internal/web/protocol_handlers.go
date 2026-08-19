@@ -251,17 +251,17 @@ func (s *Server) runOpenAIAdapter(r *http.Request, o oaiReq) (map[string]any, []
 func (s *Server) responses(w http.ResponseWriter, r *http.Request) {
 	startedAt := time.Now()
 	if r.Method != http.MethodPost {
-		writeResponsesError(w, 405, "invalid_request_error", "method not allowed")
+		writeResponsesError(w, 405, "invalid_request_error", "method_not_allowed", "method not allowed")
 		return
 	}
 	var body responsesRequest
 	if json.NewDecoder(r.Body).Decode(&body) != nil {
-		writeResponsesError(w, 400, "invalid_request_error", "bad json")
+		writeResponsesError(w, 400, "invalid_request_error", "invalid_json", "bad json")
 		return
 	}
 	o, isCompaction, err := body.openAIWithCompaction()
 	if err != nil {
-		writeResponsesError(w, 400, "invalid_request_error", err.Error())
+		writeResponsesError(w, 400, "invalid_request_error", "invalid_parameter", err.Error())
 		return
 	}
 	tenant := apiKeyTenant(r)
@@ -271,7 +271,7 @@ func (s *Server) responses(w http.ResponseWriter, r *http.Request) {
 		messages := append([]oaiMsg(nil), prior.Messages...)
 		s.responseMu.Unlock()
 		if !ok || len(messages) == 0 {
-			writeResponsesError(w, 400, "invalid_request_error", "unknown previous_response_id")
+			writeResponsesError(w, 400, "invalid_request_error", "invalid_parameter", "unknown previous_response_id")
 			return
 		}
 		o.Messages = append(messages, o.Messages...)
@@ -289,15 +289,15 @@ func (s *Server) responses(w http.ResponseWriter, r *http.Request) {
 	}
 	out, raw, status, err := s.runOpenAIAdapter(r, o)
 	if status >= 400 {
-		writeResponsesError(w, status, "upstream_error", errorMessage(raw, "upstream protocol error"))
+		writeResponsesError(w, status, "upstream_error", "bad_gateway", errorMessage(raw, "upstream protocol error"))
 		return
 	}
 	if err != nil {
-		writeResponsesError(w, http.StatusBadGateway, "upstream_error", "upstream protocol error: "+err.Error())
+		writeResponsesError(w, http.StatusBadGateway, "upstream_error", "bad_gateway", "upstream protocol error: "+err.Error())
 		return
 	}
 	if !responsesOutputHasContent(out) {
-		writeResponsesError(w, http.StatusBadGateway, "upstream_error", "ChatHub returned an empty response; no reusable message was created")
+		writeResponsesError(w, http.StatusBadGateway, "upstream_error", "bad_gateway", "ChatHub returned an empty response; no reusable message was created")
 		return
 	}
 	msg, _ := openAIChoice(out)
@@ -377,16 +377,16 @@ func (s *Server) responses(w http.ResponseWriter, r *http.Request) {
 func (s *Server) compactionTurn(w http.ResponseWriter, r *http.Request, o oaiReq, model string, stream bool, startedAt time.Time) {
 	out, raw, status, err := s.runOpenAIAdapter(withCompactionTurn(r), o)
 	if status >= 400 {
-		writeResponsesError(w, status, "upstream_error", errorMessage(raw, "upstream protocol error"))
+		writeResponsesError(w, status, "upstream_error", "bad_gateway", errorMessage(raw, "upstream protocol error"))
 		return
 	}
 	if err != nil {
-		writeResponsesError(w, http.StatusBadGateway, "upstream_error", "upstream protocol error: "+err.Error())
+		writeResponsesError(w, http.StatusBadGateway, "upstream_error", "bad_gateway", "upstream protocol error: "+err.Error())
 		return
 	}
 	summary, ok := compactionSummary(out)
 	if !ok {
-		writeResponsesError(w, http.StatusBadGateway, "upstream_error", "ChatHub returned no compaction summary")
+		writeResponsesError(w, http.StatusBadGateway, "upstream_error", "compaction_failed", "ChatHub returned no compaction summary")
 		return
 	}
 	estimate := estimateResponsesUsage(model, o.Messages, o.Tools, o.ToolChoice, summary)
@@ -420,17 +420,17 @@ func responsesOutputHasContent(src map[string]any) bool {
 func (s *Server) anthropicMessages(w http.ResponseWriter, r *http.Request) {
 	startedAt := time.Now()
 	if r.Method != http.MethodPost {
-		writeAnthropicError(w, 405, "invalid_request_error", "method not allowed")
+		writeAnthropicError(w, 405, "invalid_request_error", "method_not_allowed", "method not allowed")
 		return
 	}
 	var body anthropicRequest
 	if json.NewDecoder(r.Body).Decode(&body) != nil {
-		writeAnthropicError(w, 400, "invalid_request_error", "bad json")
+		writeAnthropicError(w, 400, "invalid_request_error", "invalid_json", "bad json")
 		return
 	}
 	o, err := body.openAI()
 	if err != nil {
-		writeAnthropicError(w, 400, "invalid_request_error", err.Error())
+		writeAnthropicError(w, 400, "invalid_request_error", "invalid_parameter", err.Error())
 		return
 	}
 	model := firstNonEmpty(body.Model, "m365-copilot")
@@ -443,11 +443,11 @@ func (s *Server) anthropicMessages(w http.ResponseWriter, r *http.Request) {
 	}
 	out, raw, status, err := s.runOpenAIAdapter(r, o)
 	if status >= 400 {
-		writeAnthropicError(w, status, "api_error", errorMessage(raw, "upstream protocol error"))
+		writeAnthropicError(w, status, "api_error", "bad_gateway", errorMessage(raw, "upstream protocol error"))
 		return
 	}
 	if err != nil {
-		writeAnthropicError(w, http.StatusBadGateway, "api_error", "upstream protocol error: "+err.Error())
+		writeAnthropicError(w, http.StatusBadGateway, "api_error", "bad_gateway", "upstream protocol error: "+err.Error())
 		return
 	}
 	msg, _ := openAIChoice(out)

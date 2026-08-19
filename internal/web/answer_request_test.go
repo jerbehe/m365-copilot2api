@@ -20,7 +20,7 @@ func answerRequestTestBody() oaiReq {
 }
 
 func TestBuildAnswerRequestRouterOmitsNativePlugins(t *testing.T) {
-	req := buildAnswerRequest("[user]\nhello", "magic", answerRequestTestBody(), agentLedger{}, "router")
+	req := buildAnswerRequest("[user]\nhello", "magic", answerRequestTestBody(), agentLedger{}, "router", "")
 	if len(req.Tools) != 0 || req.ToolChoice != nil {
 		t.Fatalf("router answer leaked native tools: tools=%d choice=%#v", len(req.Tools), req.ToolChoice)
 	}
@@ -30,7 +30,7 @@ func TestBuildAnswerRequestRouterOmitsNativePlugins(t *testing.T) {
 }
 
 func TestBuildAnswerRequestNativeForwardsTools(t *testing.T) {
-	req := buildAnswerRequest("[user]\nhello", "magic", answerRequestTestBody(), agentLedger{}, "native")
+	req := buildAnswerRequest("[user]\nhello", "magic", answerRequestTestBody(), agentLedger{}, "native", "")
 	if len(req.Tools) != 1 || req.ToolChoice != "auto" {
 		t.Fatalf("native answer lost tools: tools=%d choice=%#v", len(req.Tools), req.ToolChoice)
 	}
@@ -38,8 +38,18 @@ func TestBuildAnswerRequestNativeForwardsTools(t *testing.T) {
 
 func TestBuildAnswerRequestDoesNotInjectRouterEvidence(t *testing.T) {
 	ledger := agentLedger{Completed: []toolEvidence{{ID: "call_1", Name: "read_file", Arguments: `{}`, Result: "ok"}}}
-	req := buildAnswerRequest("[user]\nsummarize", "magic", answerRequestTestBody(), ledger, "router")
+	req := buildAnswerRequest("[user]\nsummarize", "magic", answerRequestTestBody(), ledger, "router", "")
 	if req.Text != "[user]\nsummarize" {
 		t.Fatalf("router evidence contaminated final answer prompt: %q", req.Text)
+	}
+}
+
+func TestBuildAnswerRequestMCPForwardsTools(t *testing.T) {
+	req := buildAnswerRequest("[user]\nhello", "magic", answerRequestTestBody(), agentLedger{}, "router", "http://127.0.0.1:4142/v1/mcp/sse")
+	if len(req.Tools) != 1 || req.ToolChoice != "auto" {
+		t.Fatalf("MCP answer lost tools: tools=%d choice=%#v", len(req.Tools), req.ToolChoice)
+	}
+	if req.MCPServerURL != "http://127.0.0.1:4142/v1/mcp/sse" {
+		t.Fatalf("MCP URL not set: %q", req.MCPServerURL)
 	}
 }

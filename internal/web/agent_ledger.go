@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"m365-copilot2api/internal/chathub"
+	"m365-copilot2api/internal/mcp"
 	"os"
 	"regexp"
 	"sort"
@@ -152,7 +153,7 @@ func (l agentLedger) RouterContext() string {
 // The completion guard (completionEvidenceAllows) enforces the "do not claim
 // unverified success" rule after the fact, which is where that check belongs:
 // it inspects the answer instead of asking the model to police itself.
-func buildAnswerRequest(prompt, tone string, body oaiReq, ledger agentLedger, mode string) chathub.Request {
+func buildAnswerRequest(prompt, tone string, body oaiReq, ledger agentLedger, mode string, mcpServerURL string) chathub.Request {
 	_ = ledger
 	req := chathub.Request{
 		Text:           prompt,
@@ -165,6 +166,33 @@ func buildAnswerRequest(prompt, tone string, body oaiReq, ledger agentLedger, mo
 		req.Tools = body.Tools
 		req.ToolChoice = body.ToolChoice
 	}
+	if mcpServerURL != "" {
+		req.Tools = body.Tools
+		if req.ToolChoice == nil {
+			req.ToolChoice = body.ToolChoice
+		}
+	}
+	if len(body.Tools) > 0 {
+		mcpTools := make([]mcp.Tool, 0, len(body.Tools))
+		for _, t := range body.Tools {
+			var f struct {
+				Name, Description string
+				Parameters        json.RawMessage `json:"parameters"`
+			}
+			if json.Unmarshal(t.Function, &f) != nil || f.Name == "" {
+				continue
+			}
+			var schema map[string]any
+			if json.Unmarshal(f.Parameters, &schema) != nil {
+				schema = map[string]any{"type": "object"}
+			}
+			mcpTools = append(mcpTools, mcp.Tool{Name: f.Name, Description: f.Description, InputSchema: schema})
+		}
+		if len(mcpTools) > 0 {
+			mcp.GlobalToolRegistry.MergeTools(mcpTools)
+		}
+	}
+	req.MCPServerURL = mcpServerURL
 	return req
 }
 func canonicalToolArguments(s string) string {

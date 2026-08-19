@@ -30,6 +30,20 @@ func (c *ToolCache) Replace(tools []Tool) {
 	c.mu.Unlock()
 }
 
+func (c *ToolCache) Merge(tools []Tool) {
+	c.mu.Lock()
+	existing := map[string]bool{}
+	for _, t := range c.tools {
+		existing[t.Name] = true
+	}
+	for _, t := range tools {
+		if !existing[t.Name] {
+			c.tools = append(c.tools, t)
+		}
+	}
+	c.mu.Unlock()
+}
+
 func (c *ToolCache) List() []Tool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()

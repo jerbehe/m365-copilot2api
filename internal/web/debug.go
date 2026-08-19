@@ -43,6 +43,7 @@ func openDebugStore() *debugStore {
 	}
 	return &debugStore{path: p}
 }
+
 var sensitiveKeys = map[string]bool{
 	"api_key": true, "apikey": true, "apiKey": true, "authorization": true,
 	"access_token": true, "accessToken": true, "refresh_token": true, "refreshToken": true,

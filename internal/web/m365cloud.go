@@ -201,7 +201,13 @@ func (c *M365CloudClient) ListConversations() ([]map[string]any, error) {
 	}
 	historyList, ok := historyRaw.(map[string]any)
 	if !ok {
-		log.Printf("[m365-cloud] conversationPageHistoryList unexpected type: %T, treating as empty", historyRaw)
+		log.Printf("[m365-cloud] conversationPageHistoryList unexpected type: %T, treating as empty. store keys: %v", historyRaw, func() []string {
+			keys := make([]string, 0)
+			for k := range store {
+				keys = append(keys, k)
+			}
+			return keys
+		}())
 		return []map[string]any{}, nil
 	}
 
