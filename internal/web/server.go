@@ -1997,7 +1997,7 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 		log.Printf("[req-trace] id=%s stage=narration_withheld text=%q", requestID, res.Text)
 		res.Text = toolNarrationNotice
 	} else {
-		res.Text = stripToolProtocolMarkers(res.Text)
+		res.Text = stripToolProtocolMarkersWhole(res.Text)
 	}
 	log.Printf("[debug] res.Text bytes=%d content=%q", len(res.Text), res.Text)
 	created := time.Now().Unix()

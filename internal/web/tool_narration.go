@@ -27,8 +27,18 @@ var bareRouterMarker = regexp.MustCompile(`(?is)^[ \t>*-]*(?:CALL_TOOL|call_tool
 var toolIntentPhrase = regexp.MustCompile(`(?i)(I (?:am|will|'ll|'m)\s+(?:going to\s+)?(?:now\s+)?(?:choos|select|us|call|invok|pick)|I\s+(?:choose|select|use|call|invoke|need)\b|(?:choosing|selecting|calling|invoking|using)\s+the\b|将(?:要)?(?:使用|调用|选择)|(?:需要|打算|准备)(?:使用|调用|选择)|^\s*(?:选择|使用|调用)|工具(?:来|以|去)?(?:检查|查看|读取|执行|实现|完成)|tool\s+to\s+(?:inspect|check|read|run|implement|create|verify))`)
 
 // stripToolProtocolMarkers removes router envelope tokens from text that is about
-// to be forwarded as prose.
+// to be forwarded as prose. It must NOT trim surrounding whitespace: it runs on
+// individual stream deltas, where a delta's leading newline is the separator
+// between markdown blocks — trimming it glues paragraphs and table rows
+// together.
 func stripToolProtocolMarkers(text string) string {
+	return routerEnvelopeMarker.ReplaceAllString(text, "")
+}
+
+// stripToolProtocolMarkersWhole is the whole-text variant: the complete answer
+// is known, so the stray whitespace a removed marker leaves at the edges can be
+// trimmed safely.
+func stripToolProtocolMarkersWhole(text string) string {
 	return strings.TrimSpace(routerEnvelopeMarker.ReplaceAllString(text, ""))
 }
 

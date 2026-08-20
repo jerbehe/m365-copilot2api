@@ -66,7 +66,7 @@ func TestStripToolProtocolMarkers(t *testing.T) {
 		"ordinary answer":       "ordinary answer",
 	}
 	for in, want := range cases {
-		if got := stripToolProtocolMarkers(in); got != want {
+		if got := stripToolProtocolMarkersWhole(in); got != want {
 			t.Errorf("strip(%q)=%q want %q", in, got, want)
 		}
 	}
