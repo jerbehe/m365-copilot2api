@@ -54,3 +54,4 @@ AGENTS.md
 *.bak*
 _wip_backup_*
 *.dll
+.tool_availability_probe.txt
