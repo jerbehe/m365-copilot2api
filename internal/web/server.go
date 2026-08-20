@@ -1357,8 +1357,29 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			s.dropTransientConversation(routeRes.ConversationID)
 		}
 		if routeErr != nil {
-			writeUpstreamError(w, routeErr)
-			return
+			s.accountPool.MarkFailure(acc.ID, routeErr, rateLimitCooldown)
+			if IsRateLimited(routeErr) || IsAuthFailure(routeErr) {
+				next, nerr := s.nextHealthyAccount(acc.ID)
+				if nerr == nil {
+					ctx2, cancel2 := context.WithTimeout(r.Context(), time.Duration(s.settings.get().ChatTimeoutSeconds)*time.Second)
+					defer cancel2()
+					if res2, err2 := s.chatWithAccount(ctx2, next.ID, chathub.Account{AccessToken: next.AccessToken, OID: next.OID, TID: next.TID}, chathub.Request{Text: routePrompt, Tone: tone, Attachments: body.Attachments}); err2 == nil {
+						routeRes, routeErr = res2, nil
+						acc = next
+						account = chathub.Account{AccessToken: next.AccessToken, OID: next.OID, TID: next.TID}
+						if routeRes.ConversationID != "" {
+							s.dropTransientConversation(routeRes.ConversationID)
+						}
+					} else {
+						s.accountPool.MarkFailure(next.ID, err2, rateLimitCooldown)
+					}
+				}
+			}
+			if routeErr != nil {
+				writeUpstreamError(w, routeErr)
+				return
+			}
+			s.accountPool.MarkSuccess(acc.ID)
 		}
 		calls, parsed := parseModelToolDecision(routeRes.Text, routeMaps, body.ToolChoice)
 		calls = filterCompletedCalls(calls, ledger)
@@ -1372,6 +1393,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 				calls = filterCompletedCalls(calls, ledger)
 			}
 		}
+		calls, _ = validateCalls("router", calls)
 		if parsed && len(calls) > 0 {
 			scope := fmt.Sprintf("%d:%v:stream", len(body.Messages), completedCallIDs(ledger))
 			for i := range calls {
@@ -1566,6 +1588,9 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			pending.WriteString(res.Text)
 		}
 		calls := streamedTools
+		if len(calls) > 0 {
+			calls, _ = validateCalls("stream-events", calls)
+		}
 		if len(calls) == 0 {
 			calls, _ = validateCalls("stream", answerToolCalls(text.String(), toolMaps, body.ToolChoice))
 		}
@@ -1665,17 +1690,20 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			s.accountPool.MarkSuccess(acc.ID)
 		}
 		calls, parsed := parseModelToolDecision(routeRes.Text, routeMaps, body.ToolChoice)
+		calls = filterCompletedCalls(calls, ledger)
 		if !parsed {
 			repairRes, repairErr := s.chat.Chat(ctx, account, chathub.Request{Text: `Repair this tool routing output into JSON only with shape {"calls":[{"name":"function_name","arguments":{}}]}. Do not invent calls; use {"calls":[]} if unrecoverable. OUTPUT:
 ` + compactToolResult(routeRes.Text, 6000), Tone: tone, Attachments: body.Attachments})
 			if repairErr == nil {
 				calls, parsed = parseModelToolDecision(repairRes.Text, routeMaps, body.ToolChoice)
+				calls = filterCompletedCalls(calls, ledger)
 			}
 			if !parsed {
 				writeOpenAIError(w, http.StatusBadGateway, "server_error", "tool_router_failed", "model returned an invalid tool routing decision")
 				return
 			}
 		}
+		calls, _ = validateCalls("router", calls)
 		if len(calls) > 0 {
 			scope := fmt.Sprintf("%d:%v", len(body.Messages), completedCallIDs(ledger))
 			for i := range calls {
@@ -1898,16 +1926,24 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 	id := "chatcmpl-" + uuid.NewString()
 	if rawCalls := answerToolCalls(res.Text, toolMaps, body.ToolChoice); len(rawCalls) > 0 {
 		calls, _ := validateCalls("fenced", rawCalls)
-		calls = limitToolCalls(calls, adaptiveToolCallLimit(calls, configuredToolCallLimit(s.settings)))
-		// res.Text is the model's own answer here, so any prose around the call
-		// syntax is a preamble the client should still see.
-		_ = writeToolResponse(w, toolResponse{ID: id, Model: model, Stream: body.Stream, Calls: calls, Result: res, Preamble: toolPreamble(res.Text, toolMaps), Prompt: prompt, Options: body.StreamOptions})
-		return
+		// Validation may reject every detected call (undeclared name, bad
+		// schema); falling through treats the fence as prose instead of
+		// emitting an assistant turn with an empty tool_calls array.
+		if len(calls) > 0 {
+			calls = limitToolCalls(calls, adaptiveToolCallLimit(calls, configuredToolCallLimit(s.settings)))
+			// res.Text is the model's own answer here, so any prose around the call
+			// syntax is a preamble the client should still see.
+			_ = writeToolResponse(w, toolResponse{ID: id, Model: model, Stream: body.Stream, Calls: calls, Result: res, Preamble: toolPreamble(res.Text, toolMaps), Prompt: prompt, Options: body.StreamOptions})
+			return
+		}
 	}
-	if calls := nativeToolCalls(res.Events, body.Tools); len(calls) > 0 {
-		calls = limitToolCalls(calls, adaptiveToolCallLimit(calls, configuredToolCallLimit(s.settings)))
-		_ = writeToolResponse(w, toolResponse{ID: id, Model: model, Stream: body.Stream, Calls: calls, Result: res, Preamble: toolPreamble(res.Text, toolMaps), Prompt: prompt, Options: body.StreamOptions})
-		return
+	if nativeCalls := nativeToolCalls(res.Events, body.Tools); len(nativeCalls) > 0 {
+		calls, _ := validateCalls("native", nativeCalls)
+		if len(calls) > 0 {
+			calls = limitToolCalls(calls, adaptiveToolCallLimit(calls, configuredToolCallLimit(s.settings)))
+			_ = writeToolResponse(w, toolResponse{ID: id, Model: model, Stream: body.Stream, Calls: calls, Result: res, Preamble: toolPreamble(res.Text, toolMaps), Prompt: prompt, Options: body.StreamOptions})
+			return
+		}
 	}
 	// Recover natural-language tool intent when native mode emits no
 	// structured ChatHub tool event. Plain text remains a zero-call result.
@@ -1922,6 +1958,8 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 					calls, parsed = parseModelToolDecision(repairRes.Text, routeMaps, body.ToolChoice)
 				}
 			}
+			calls = filterCompletedCalls(calls, ledger)
+			calls, _ = validateCalls("native-recovery", calls)
 			if parsed && len(calls) > 0 {
 				scope := fmt.Sprintf("%d:%v:native-recovery", len(body.Messages), completedCallIDs(ledger))
 				for i := range calls {
