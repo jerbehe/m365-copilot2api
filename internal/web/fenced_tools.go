@@ -182,22 +182,37 @@ func stripToolFences(text string, tools []map[string]any) (string, bool) {
 			return "", true
 		}
 	}
-	var b strings.Builder
+	// Removing a fence glues the surrounding prose together; without an
+	// explicit blank-line separator a heading or list on either side merges
+	// into one paragraph and markdown rendering breaks. Keep every surviving
+	// segment as its own block.
+	var pieces []string
 	last := 0
 	for _, loc := range fencedToolCall.FindAllStringSubmatchIndex(text, -1) {
 		name := text[loc[2]:loc[3]]
 		if !allowed[name] && !(isShellFenceName(name) && shell != "") {
 			continue
 		}
-		b.WriteString(text[last:loc[0]])
+		if p := segmentText(text[last:loc[0]]); p != "" {
+			pieces = append(pieces, p)
+		}
 		last = loc[1]
 		withheld = true
 	}
 	if last == 0 {
 		return text, withheld
 	}
-	b.WriteString(text[last:])
-	return b.String(), true
+	if p := segmentText(text[last:]); p != "" {
+		pieces = append(pieces, p)
+	}
+	return strings.Join(pieces, "\n\n"), true
+}
+
+// segmentText normalises a prose segment kept between removed tool fences:
+// newlines are trimmed on both ends so joining segments with a blank line
+// cannot stack blank lines, while inner indentation is preserved.
+func segmentText(s string) string {
+	return strings.Trim(s, "\r\n")
 }
 
 // withholdToolFences strips tool syntax from an assistant answer, substituting a

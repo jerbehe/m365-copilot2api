@@ -92,6 +92,20 @@ func TestStripToolFencesWithholdsOnlyToolBlocks(t *testing.T) {
 			want:         "这是普通回答，没有围栏。",
 			wantWithheld: false,
 		},
+		{
+			// Regression: removing a mid-text fence used to glue the heading and
+			// the following paragraph into one broken markdown block.
+			name:         "markdown blocks stay separated",
+			text:         "## 标题\n```exec\n{\"input\":\"ls\"}\n```\n- 列表项",
+			want:         "## 标题\n\n- 列表项",
+			wantWithheld: true,
+		},
+		{
+			name:         "consecutive fences collapse to separated prose",
+			text:         "前文\n```exec\n{\"input\":\"ls\"}\n```\n中段\n```exec\n{\"input\":\"pwd\"}\n```\n后文",
+			want:         "前文\n\n中段\n\n后文",
+			wantWithheld: true,
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -120,7 +134,7 @@ func TestWithholdToolFencesSubstitutesNoticeWhenNothingRemains(t *testing.T) {
 
 	// Surrounding prose is a usable answer and must be kept as-is.
 	got, withheld = withholdToolFences("先说明。\n```exec\n{\"input\":\"ls\"}\n```", codexExecTools())
-	if !withheld || got != "先说明。\n" {
+	if !withheld || got != "先说明。" {
 		t.Fatalf("got %q withheld=%t, want the prose preserved", got, withheld)
 	}
 }

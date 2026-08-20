@@ -1634,7 +1634,10 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			log.Printf("[req-trace] id=%s stage=stream_narration_withheld text=%q", requestID, held)
 			tail = toolNarrationNotice
 		} else if held != "" {
-			tail = held + tail
+			// The gate's held text and the buffered tail are separate prose
+			// blocks; gluing them without a blank line merges markdown
+			// structures (headings, lists, tables) into broken paragraphs.
+			tail = held + "\n\n" + strings.TrimLeft(tail, "\r\n")
 		}
 		// A withheld fence was unusable tool syntax rather than prose. No text
 		// having been emitted means the whole answer was tool syntax. An empty
