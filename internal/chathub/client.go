@@ -287,24 +287,35 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 		return Result{}, fmt.Errorf("chat send: %w", err)
 	}
 
-	var deltas []string
-	var streamed strings.Builder
-	emitDelta := func(d string) error {
+	// The answer buffer decides what is safe to forward given that ChatHub
+	// rewrites text it has already sent (markdown link conversion, language
+	// switches). See answer_buffer.go for the two-snapshot agreement invariant.
+	var answer answerBuffer
+	firstForward := true
+	forward := func(d string) error {
 		if d == "" {
 			return nil
 		}
-		if chTrace {
-			log.Printf("[trace:emitDelta] len=%d streamed=%d preview=%q", len(d), streamed.Len()+len(d), truncate(d, 80))
-		}
-		if streamed.Len() == 0 {
+		if firstForward {
+			firstForward = false
 			log.Printf("chathub timing first_delta_ms=%d len=%d", time.Since(payloadSentAt).Milliseconds(), len(d))
 		}
-		streamed.WriteString(d)
-		deltas = append(deltas, d)
 		if onDelta != nil {
 			return onDelta(d)
 		}
 		return nil
+	}
+	// emitDelta forwards a provisional writeAtCursor chunk. It is always new
+	// text, but only confirmed text is released; the rest waits for the next
+	// snapshot or the completion flush.
+	emitDelta := func(chunk string) error {
+		if chunk == "" {
+			return nil
+		}
+		if chTrace {
+			log.Printf("[trace:emitDelta] len=%d streamed=%d preview=%q", len(chunk), len(answer.Text()), truncate(chunk, 80))
+		}
+		return forward(answer.Append(chunk))
 	}
 	// ChatHub signals text either as a full snapshot or as cursor rewrites.
 	// Only the portion not already streamed may be emitted; naive prefix
@@ -316,7 +327,7 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 	// The "throttling" frame itself is per-conversation quota metadata and is
 	// NOT a rate-limit signal.
 	rateLimited := func(text string) bool {
-		if streamed.Len() != 0 {
+		if answer.Emitted() != 0 {
 			return false
 		}
 		t := strings.ToLower(text)
@@ -375,7 +386,7 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 			return nil
 		}
 		if chTrace {
-			log.Printf("[trace:emitSnapshot] cur=%d snapshot=%d", streamed.Len(), len(snapshot))
+			log.Printf("[trace:emitSnapshot] cur=%d snapshot=%d", answer.Emitted(), len(snapshot))
 		}
 		if rateLimited(snapshot) {
 			if meteringOutOfCredits(snapshot) {
@@ -386,18 +397,10 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 		if contentPolicyBlocked(snapshot) {
 			return ErrContentPolicyBlocked
 		}
-		cur := streamed.String()
-		if cur == "" {
-			return emitDelta(snapshot)
-		}
-		if strings.HasPrefix(snapshot, cur) {
-			return emitDelta(snapshot[len(cur):])
-		}
-		if len(snapshot) <= len(cur) {
-			return nil
-		}
-		log.Printf("[emitSnapshot] skip: cur=%d snapshot=%d (non-prefix rewrite)", len(cur), len(snapshot))
-		return nil
+		// Replace measures the snapshot against what the client actually has:
+		// an extension forwards the new tail, a rewrite re-sends past the
+		// surviving common prefix, and a shortening keeps what was sent.
+		return forward(answer.Replace(snapshot))
 	}
 	var final string
 	var throttlingInfo *ThrottlingInfo
@@ -578,13 +581,18 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 					returnConn = false
 					return Result{}, fmt.Errorf("chathub completion error: %v", errObj)
 				}
-				log.Printf("chathub timing completion_frame_ms=%d streamed_text=%d events=%d", time.Since(payloadSentAt).Milliseconds(), streamed.Len(), len(events))
-				text := streamed.String()
-				if text == "" {
-					text = final
+				// Release whatever is still buffered: the answer is final, so no
+				// further rewrite can arrive.
+				if err := forward(answer.Flush()); err != nil {
+					returnConn = false
+					return Result{}, err
 				}
+				log.Printf("chathub timing completion_frame_ms=%d streamed_text=%d emitted=%d events=%d", time.Since(payloadSentAt).Milliseconds(), len(answer.Text()), answer.Emitted(), len(events))
+				// The completion frame's result message is authoritative; the
+				// streamed text is provisional and may hold a pre-rewrite version.
+				text := final
 				if text == "" {
-					text = strings.Join(deltas, "")
+					text = answer.Text()
 				}
 				if rateLimited(text) {
 					returnConn = false
