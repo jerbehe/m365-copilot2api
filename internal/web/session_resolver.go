@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -43,6 +44,75 @@ type sessionBinding struct {
 	// 的消息，而模型回复会被它按自己的格式重新渲染——工具轮尤其明显，客户端回传
 	// 的是 content:null + tool_calls，与网关存下的纯文本对不上，逐字比对必然失配。
 	ClientPrefixLen int `json:"clientPrefixLen,omitempty"`
+	// Tenant 是绑定该会话的 API key 哈希。外部会话头与提示词指纹都由客户端控制，
+	// 不加租户隔离的话，另一个 API key 只要猜到同一个 session-id 就能接进别人的
+	// 云端对话。空租户（未启用鉴权）只与空租户匹配。
+	Tenant string `json:"tenant,omitempty"`
+	// PromptPrefix 是首条 user 消息前 N 个字符的指纹，供"提示词一致即同一会话"
+	// 这层匹配使用。
+	PromptPrefix string `json:"promptPrefix,omitempty"`
+}
+
+// externalSessionHeaders 按优先级列出可直接作为会话主键的请求头。
+// 命中即止，越靠前越优先。X-M365-Session-Id 是本网关自己的契约，排在最前；
+// session-id 与 thread-id 由 Codex 上报；X-Claude-Code-Session-Id 由 Claude Code 上报。
+var externalSessionHeaders = []string{
+	"X-M365-Session-Id",
+	"session-id",
+	"thread-id",
+	"X-Claude-Code-Session-Id",
+}
+
+// externalSessionID 返回客户端上报的会话标识及其来源头名。
+func externalSessionID(r *http.Request) (id, source string) {
+	if r == nil {
+		return "", ""
+	}
+	for _, h := range externalSessionHeaders {
+		if v := strings.TrimSpace(r.Header.Get(h)); v != "" {
+			return v, h
+		}
+	}
+	return "", ""
+}
+
+// promptPrefixChars 是参与指纹的字符数，可用 M365_PROMPT_PREFIX_CHARS 调整。
+// 设为 0（或负数）关闭整个提示词指纹层，只保留会话头与内容键两类匹配。
+func promptPrefixChars() int {
+	if v := strings.TrimSpace(os.Getenv("M365_PROMPT_PREFIX_CHARS")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
+	}
+	return 200
+}
+
+// promptPrefixKey 取首条 user 消息前 N 个字符的指纹。
+//
+// 锚点是首条 user 消息，而不是 flatten 后的整段提示词开头：agent 客户端（Codex、
+// Claude Code）的开头是两万字节级的固定 system/developer 指令，同一客户端的每个
+// 对话都逐字相同，按原始前缀取指纹会把它的全部会话判成同一个。取首条 user 消息
+// 才对应"用户真正问了什么"，也才符合"提示词一致即同一会话"的本意。
+func promptPrefixKey(messages []oaiMsg, n int) string {
+	if n <= 0 {
+		return ""
+	}
+	for _, m := range messages {
+		if m.Role != "user" {
+			continue
+		}
+		text := strings.TrimSpace(contentToString(m.Content))
+		if text == "" {
+			continue
+		}
+		runes := []rune(text)
+		if len(runes) > n {
+			runes = runes[:n]
+		}
+		h := sha256.Sum256([]byte(string(runes)))
+		return hex.EncodeToString(h[:16])
+	}
+	return ""
 }
 
 type sessionResolver struct {
@@ -200,14 +270,15 @@ func (sr *sessionResolver) Resolve(r *http.Request, body *oaiReq) ResolveResult 
 	defer sr.mu.Unlock()
 	sr.evictLocked()
 
-	explicitID := r.Header.Get("X-M365-Session-Id")
+	explicitID, idSource := externalSessionID(r)
+	tenant := apiKeyTenant(r)
 
-	// 客户端显式指定的会话 ID 是最高优先级的续接语义：不参与任何身份判定，
-	// 由调用方主动决定要继续哪个云端对话。Bind 在 sessionID 为空时直接用这个
-	// 头值当会话主键，所以按主键查一次即可。这里曾经还套了一层 byExplicit 索引，
-	// 但那个 map 从未有过写入点、恒为空，查询永远走不到，已连同字段一起移除。
+	// 客户端上报的会话标识是最高优先级的续接语义：由调用方明确指定要继续哪个
+	// 云端对话，不参与内容判定。按 externalSessionHeaders 的优先级取第一个非空
+	// 头值当会话主键，Bind 走同一套逻辑，所以按主键查一次即可。
+	// 租户必须一致：这些头由客户端控制，否则换个 API key 猜中 ID 就能接进别人的对话。
 	if explicitID != "" {
-		if sess, ok := sr.sessions[explicitID]; ok {
+		if sess, ok := sr.sessions[explicitID]; ok && sess.Tenant == tenant {
 			sess.LastUsedAt = time.Now().UTC()
 			sr.sessions[explicitID] = sess
 			sr.persist.markDirty()
@@ -222,7 +293,7 @@ func (sr *sessionResolver) Resolve(r *http.Request, body *oaiReq) ResolveResult 
 				SessionID:      sess.SessionID,
 				ConversationID: sess.ConversationID,
 				AccountID:      sess.AccountID,
-				MatchedBy:      "explicit",
+				MatchedBy:      "header_" + strings.ToLower(idSource),
 				IsNew:          false,
 				HistoryLen:     historyLen,
 			}
@@ -233,6 +304,28 @@ func (sr *sessionResolver) Resolve(r *http.Request, body *oaiReq) ResolveResult 
 	// 浜戠瀵硅瘽锛屼絾鍙湪鍚屼竴 IP/UA 鎸囩汗涓嬶紝閬垮厤鐭秷鎭湪涓嶅悓鐢ㄦ埛闂翠簰绔?
 	// HistoryLen 杩斿洖璇ュ墠缂€闀垮害锛屼笂灞傛嵁姝ゅ彧鍙戦€?messages[HistoryLen:] 澧為噺銆?
 	ipFinger := clientIPFingerprint(r)
+
+	// 提示词指纹层：首条 user 消息的前 N 个字符一致即视为同一会话，目的是让
+	// 重复的提问尽量落回同一个云端对话、压低 M365 侧的会话总数。
+	// 它不校验内容前缀，所以增量边界未知——由 promptPrefixIncrement 处理：能用
+	// 会话历史核对出边界就用，核对不上就只发最后一条，把重复限制在一条消息内。
+	if key := promptPrefixKey(body.Messages, promptPrefixChars()); key != "" {
+		if bestID := sr.matchPromptPrefixLocked(tenant, ipFinger, key); bestID != "" {
+			sess := sr.sessions[bestID]
+			sess.LastUsedAt = time.Now().UTC()
+			sr.sessions[bestID] = sess
+			sr.persist.markDirty()
+			return ResolveResult{
+				SessionID:      sess.SessionID,
+				ConversationID: sess.ConversationID,
+				AccountID:      sess.AccountID,
+				MatchedBy:      "prompt_prefix",
+				IsNew:          false,
+				HistoryLen:     sr.promptPrefixIncrementLocked(sess, body.Messages),
+			}
+		}
+	}
+
 	if bestID, n := sr.matchContextLocked(ipFinger, body.Messages); bestID != "" {
 		sess := sr.sessions[bestID]
 		sess.LastUsedAt = time.Now().UTC()
@@ -260,6 +353,51 @@ func (sr *sessionResolver) Resolve(r *http.Request, body *oaiReq) ResolveResult 
 // matchContextLocked 浠庡叏閮ㄤ細璇濅腑鎵惧埌鍏?contextHistory 涓ユ牸浣滀负娑堟伅鍓嶇紑鐨?
 // 閭ｄ釜浼氳瘽锛涘彧閫夊墠缂€鏈€闀跨殑涓€涓紝閬垮厤鐭墠缂€鍦ㄤ笉鍚屼細璇濋棿浜掓挒銆傝繑鍥?
 // (sessionID, 鍖归厤鍒扮殑娑堟伅鏉℃暟)銆?
+// matchPromptPrefixLocked 找出同租户、同客户端指纹下提示词指纹相同且最近使用的
+// 会话。相对内容键那层放宽的地方是不要求内容构成严格前缀——客户端压缩或改写过
+// 历史时仍能落回同一个云端对话，这正是这层存在的意义。
+func (sr *sessionResolver) matchPromptPrefixLocked(tenant, ipFinger, key string) string {
+	best := ""
+	var recent time.Time
+	for id, sess := range sr.sessions {
+		if sess.PromptPrefix != key || sess.Tenant != tenant {
+			continue
+		}
+		// 同时要求 IP/UA 指纹一致。只按租户隔离在这个网关的常见部署下不够：
+		// 多人共用一个 API key（甚至完全不启用鉴权，租户恒为空）时，任何人只要
+		// 打出同样的首句提问就会接进别人的云端对话。加上指纹后，对 Codex/
+		// Claude Code 这类跑在固定机器上的客户端没有任何损失。
+		if sess.IPFingerprint != ipFinger {
+			continue
+		}
+		if time.Since(sess.LastUsedAt) > sr.contextTTL {
+			continue
+		}
+		if best == "" || sess.LastUsedAt.After(recent) {
+			best, recent = id, sess.LastUsedAt
+		}
+	}
+	return best
+}
+
+// promptPrefixIncrementLocked 给指纹命中的会话算增量起点。
+//
+// 指纹相同不代表内容仍然对得上（同一个问题开了新话题、客户端压缩过上下文），
+// 所以先尝试用会话历史核对严格前缀：核对成功说明这确实是同一条对话的延续，
+// 用精确边界；核对失败则退回只发最后一条——此时云端历史与客户端已经分叉，
+// 发全量会把整段历史重复灌进去，发最后一条把重复限制在一条消息内。
+func (sr *sessionResolver) promptPrefixIncrementLocked(sess sessionBinding, messages []oaiMsg) int {
+	if !sess.HistoryTruncated {
+		if n := contextPrefixLen(sess.comparableHistory(), messages); n >= 1 {
+			return incrementStart(skipAssistantEcho(n, messages), len(messages))
+		}
+	}
+	if len(messages) <= 1 {
+		return 0
+	}
+	return len(messages) - 1
+}
+
 func (sr *sessionResolver) matchContextLocked(ipFinger string, messages []oaiMsg) (string, int) {
 	if len(messages) == 0 {
 		return "", 0
@@ -410,10 +548,14 @@ func (sr *sessionResolver) Bind(sessionID, conversationID, accountID string, bod
 	if strings.TrimSpace(assistantText) != "" {
 		history = append(history, oaiMsg{Role: "assistant", Content: assistantText})
 	}
-	explicitID := r.Header.Get("X-M365-Session-Id")
+	// 会话主键与 Resolve 用同一套优先级：客户端上报了标识就直接拿它当主键，
+	// 这样下一轮带同一个头进来时按主键一次就能查到。
+	explicitID, _ := externalSessionID(r)
 	if explicitID != "" && sessionID == "" {
 		sessionID = explicitID
 	}
+	tenant := apiKeyTenant(r)
+	promptPrefix := promptPrefixKey(body.Messages, promptPrefixChars())
 	// 同一云端对话只保留一条记录：内容键命中后增量轮次更新已存在会话，
 	// 而不是每次 Bind 都新建一条，避免 sessions.json 膨胀。
 	if sessionID != "" {
@@ -427,6 +569,8 @@ func (sr *sessionResolver) Bind(sessionID, conversationID, accountID string, bod
 			sess.ContextHistory = history
 			sess.HistoryTruncated = truncated
 			sess.ClientPrefixLen = clientPrefixLen
+			sess.Tenant = tenant
+			sess.PromptPrefix = promptPrefix
 			sr.sessions[sessionID] = sess
 			sr.reindexLocked(sess)
 			sr.persist.markDirty()
@@ -444,6 +588,8 @@ func (sr *sessionResolver) Bind(sessionID, conversationID, accountID string, bod
 				sess.ContextHistory = history
 				sess.HistoryTruncated = truncated
 				sess.ClientPrefixLen = clientPrefixLen
+				sess.Tenant = tenant
+				sess.PromptPrefix = promptPrefix
 				sr.sessions[sid] = sess
 				sr.reindexLocked(sess)
 				sr.persist.markDirty()
@@ -465,6 +611,8 @@ func (sr *sessionResolver) Bind(sessionID, conversationID, accountID string, bod
 		ContextHistory:   history,
 		HistoryTruncated: truncated,
 		ClientPrefixLen:  clientPrefixLen,
+		Tenant:           tenant,
+		PromptPrefix:     promptPrefix,
 	}
 
 	sr.reindexLocked(sess)

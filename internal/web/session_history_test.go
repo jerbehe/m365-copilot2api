@@ -136,9 +136,15 @@ func TestOversizedHistoryKeepsTailButBlocksReuse(t *testing.T) {
 		t.Fatalf("片段不应超过上限+1条回复, got %d", len(sess.ContextHistory))
 	}
 
-	// 截断会话不得被内容键匹配命中。
+	// 截断的历史不得参与逐字前缀比对。提示词指纹层仍可命中（它不依赖历史），
+	// 但此时增量边界无法核对，必须退回"只发最后一条"，不能拿片段算出错位的起点。
 	if res := sr.Resolve(req, &oaiReq{Messages: msgs}); !res.IsNew {
-		t.Fatalf("截断会话不应被内容键命中, matched=%s", res.MatchedBy)
+		if res.MatchedBy != "prompt_prefix" {
+			t.Fatalf("截断会话只允许被提示词指纹命中, matched=%s", res.MatchedBy)
+		}
+		if res.HistoryLen != len(msgs)-1 {
+			t.Fatalf("截断会话命中后增量应只有最后一条, want %d, got %d", len(msgs)-1, res.HistoryLen)
+		}
 	}
 	// 也不得被 user/conv-id 路径的核对通过。
 	if n, ok := sr.ConversationPrefixLen("conv-big", msgs); ok {
@@ -149,7 +155,7 @@ func TestOversizedHistoryKeepsTailButBlocksReuse(t *testing.T) {
 	explicitReq := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
 	explicitReq.Header.Set(sessionHeaderName, "sess-big")
 	res := sr.Resolve(explicitReq, &oaiReq{Messages: msgs})
-	if res.IsNew || res.MatchedBy != "explicit" {
+	if res.IsNew || !strings.HasPrefix(res.MatchedBy, "header_") {
 		t.Fatalf("显式续接应命中, got new=%v matched=%s", res.IsNew, res.MatchedBy)
 	}
 	if res.HistoryLen != 0 {

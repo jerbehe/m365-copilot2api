@@ -33,8 +33,10 @@ func TestResolveContentKeyedSameIdentity(t *testing.T) {
 	if res.IsNew {
 		t.Fatal("同 IP/UA 前缀相同却未复用会话，内容键失效")
 	}
-	if res.MatchedBy != "context_prefix_2" {
-		t.Fatalf("expected context_prefix_2, got %q", res.MatchedBy)
+	// 提示词指纹层优先级高于内容键，两者在这个场景下给出相同的复用目标与增量
+	// 起点，只是 MatchedBy 不同。下面的对话 ID 与 HistoryLen 才是实质断言。
+	if res.MatchedBy != "prompt_prefix" && res.MatchedBy != "context_prefix_2" {
+		t.Fatalf("expected prompt_prefix or context_prefix_2, got %q", res.MatchedBy)
 	}
 	if res.ConversationID != "conv-shared" {
 		t.Fatalf("expected conversation conv-shared, got %s", res.ConversationID)
