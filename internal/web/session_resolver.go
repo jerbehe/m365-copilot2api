@@ -384,18 +384,21 @@ func (sr *sessionResolver) matchPromptPrefixLocked(tenant, ipFinger, key string)
 //
 // 指纹相同不代表内容仍然对得上（同一个问题开了新话题、客户端压缩过上下文），
 // 所以先尝试用会话历史核对严格前缀：核对成功说明这确实是同一条对话的延续，
-// 用精确边界；核对失败则退回只发最后一条——此时云端历史与客户端已经分叉，
-// 发全量会把整段历史重复灌进去，发最后一条把重复限制在一条消息内。
+// 用精确边界。
+//
+// 核对失败时返回 0，也就是发全量。曾经这里返回 len-1（只发最后一条），理由是
+// "把重复限制在一条消息内"，但那对 agent 请求是致命的：云端存的是另一条对话的
+// 上下文，只发一条孤立消息（往往还只是个工具结果）会让模型既看不到任务背景也
+// 看不到工作区描述，于是据实推断"没有执行桥、工作区未挂载"并拒绝继续。
+// 云端状态相对本次请求未知时，唯一安全的选择是把客户端给的完整上下文发过去；
+// 多花一次全量的代价，远小于交付一个无法工作的回答。
 func (sr *sessionResolver) promptPrefixIncrementLocked(sess sessionBinding, messages []oaiMsg) int {
 	if !sess.HistoryTruncated {
 		if n := contextPrefixLen(sess.comparableHistory(), messages); n >= 1 {
 			return incrementStart(skipAssistantEcho(n, messages), len(messages))
 		}
 	}
-	if len(messages) <= 1 {
-		return 0
-	}
-	return len(messages) - 1
+	return 0
 }
 
 func (sr *sessionResolver) matchContextLocked(ipFinger string, messages []oaiMsg) (string, int) {

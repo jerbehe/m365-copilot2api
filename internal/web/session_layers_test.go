@@ -113,9 +113,10 @@ func TestPromptPrefixMatchesDespiteDivergedHistory(t *testing.T) {
 	if res.MatchedBy != "prompt_prefix" {
 		t.Fatalf("应由提示词指纹命中, got %q", res.MatchedBy)
 	}
-	// 内容已分叉，边界无法核对，只发最后一条把重复限制在一条消息内。
-	if res.HistoryLen != 1 {
-		t.Fatalf("分叉后增量应只有最后一条, want 1, got %d", res.HistoryLen)
+	// 内容已分叉，云端状态相对本次请求未知，必须发全量。只发最后一条会让模型
+	// 丢失任务上下文与工作区描述，进而拒绝继续（"未提供执行桥/工作区未挂载"）。
+	if res.HistoryLen != 0 {
+		t.Fatalf("分叉后应发全量, want 0, got %d", res.HistoryLen)
 	}
 }
 

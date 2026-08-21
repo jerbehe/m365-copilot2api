@@ -142,8 +142,10 @@ func TestOversizedHistoryKeepsTailButBlocksReuse(t *testing.T) {
 		if res.MatchedBy != "prompt_prefix" {
 			t.Fatalf("截断会话只允许被提示词指纹命中, matched=%s", res.MatchedBy)
 		}
-		if res.HistoryLen != len(msgs)-1 {
-			t.Fatalf("截断会话命中后增量应只有最后一条, want %d, got %d", len(msgs)-1, res.HistoryLen)
+		// 云端状态无法核对时必须发全量：只发一条会让模型丢失任务上下文与工作区
+		// 描述，从而编造"未挂载/无执行桥"之类的结论并拒绝继续。
+		if res.HistoryLen != 0 {
+			t.Fatalf("截断会话命中后应发全量, want 0, got %d", res.HistoryLen)
 		}
 	}
 	// 也不得被 user/conv-id 路径的核对通过。
