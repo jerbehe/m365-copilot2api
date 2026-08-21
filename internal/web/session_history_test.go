@@ -262,3 +262,93 @@ func TestConversationDetailShowsTruncatedHistory(t *testing.T) {
 		t.Fatalf("末项应是模型回复, got %q", contentToString(last.Content))
 	}
 }
+
+// O 的回归：工具调用轮不得打断复用链。
+//
+// Codex / Claude Code 这类 agent 客户端回传助手轮的形状是 content:null + tool_calls，
+// 与网关存下的纯文本回复对不上。旧实现拿它做逐字比对，messagesEqual 的 ToolCalls
+// nil 检查在第一个工具轮就失配，于是每个请求都新建云端对话——这正是"会话暴涨、
+// 从不复用"的直接原因。
+func TestToolCallTurnsDoNotBreakReuse(t *testing.T) {
+	t.Setenv("M365_SESSION_CACHE", filepath.Join(t.TempDir(), "sessions.json"))
+	sr := openSessionResolver()
+	req := historyProbeRequest()
+
+	toolCall := []map[string]any{{
+		"id":   "call_1",
+		"type": "function",
+		"function": map[string]any{
+			"name":      "exec_command",
+			"arguments": `{"cmd":"ls"}`,
+		},
+	}}
+
+	// 第 1 轮：客户端发 system + user，网关回了一个工具调用。
+	turn1 := []oaiMsg{
+		{Role: "system", Content: "You are Codex"},
+		{Role: "user", Content: "列出文件"},
+	}
+	sr.Bind("", "conv-agent", "acc1", &oaiReq{Messages: turn1}, "我来执行命令", req)
+
+	// 第 2 轮：客户端按自己的格式回传助手轮（content 为空 + tool_calls），
+	// 再附上工具结果。这与网关存的 "我来执行命令" 逐字不同。
+	turn2 := []oaiMsg{
+		turn1[0], turn1[1],
+		{Role: "assistant", Content: nil, ToolCalls: toolCall},
+		{Role: "tool", Content: "a.go b.go"},
+	}
+	res := sr.Resolve(req, &oaiReq{Messages: turn2})
+	if res.IsNew {
+		t.Fatal("工具轮之后必须仍能复用云端对话；失配会导致每请求新建对话")
+	}
+	if res.ConversationID != "conv-agent" {
+		t.Fatalf("应命中 conv-agent, got %s", res.ConversationID)
+	}
+	// 云端已有 system+user+助手回复，增量应当只有工具结果那一条。
+	if res.HistoryLen != 3 {
+		t.Fatalf("增量起点应跳过客户端回传的助手轮, want 3, got %d", res.HistoryLen)
+	}
+	if got := contentToString(turn2[res.HistoryLen].Content); got != "a.go b.go" {
+		t.Fatalf("增量首条应是工具结果, got %q", got)
+	}
+
+	// 第 3 轮：继续往下走一轮，验证链条不是只对第一轮有效。
+	sr.Bind("", "conv-agent", "acc1", &oaiReq{Messages: turn2}, "文件是 a.go 和 b.go", req)
+	turn3 := append(append([]oaiMsg{}, turn2...),
+		oaiMsg{Role: "assistant", Content: "文件是 a.go 和 b.go"},
+		oaiMsg{Role: "user", Content: "统计行数"},
+	)
+	res3 := sr.Resolve(req, &oaiReq{Messages: turn3})
+	if res3.IsNew {
+		t.Fatal("第三轮仍应复用")
+	}
+	if res3.HistoryLen != len(turn2)+1 {
+		t.Fatalf("第三轮增量起点应跳过助手回传, want %d, got %d", len(turn2)+1, res3.HistoryLen)
+	}
+	if got := contentToString(turn3[res3.HistoryLen].Content); got != "统计行数" {
+		t.Fatalf("增量首条应是新提问, got %q", got)
+	}
+}
+
+// 客户端丢弃了助手回复、直接追加新提问时不得误跳，否则会吞掉真正的新增消息。
+func TestNoEchoSkipWhenClientOmitsAssistant(t *testing.T) {
+	t.Setenv("M365_SESSION_CACHE", filepath.Join(t.TempDir(), "sessions.json"))
+	sr := openSessionResolver()
+	req := historyProbeRequest()
+
+	base := []oaiMsg{{Role: "user", Content: "问题一"}}
+	sr.Bind("", "conv-noecho", "acc1", &oaiReq{Messages: base}, "回答一", req)
+
+	// 客户端没有回传助手轮，直接追加了新提问。
+	next := []oaiMsg{base[0], {Role: "user", Content: "问题二"}}
+	res := sr.Resolve(req, &oaiReq{Messages: next})
+	if res.IsNew {
+		t.Fatal("应命中")
+	}
+	if res.HistoryLen != 1 {
+		t.Fatalf("不得跳过非 assistant 的消息, want 1, got %d", res.HistoryLen)
+	}
+	if got := contentToString(next[res.HistoryLen].Content); got != "问题二" {
+		t.Fatalf("新提问不能被吞掉, got %q", got)
+	}
+}

@@ -38,6 +38,11 @@ type sessionBinding struct {
 	// 片段不是任何消息序列的前缀，拿它做前缀比对会从第一条起就错位，所以匹配路径
 	// 必须跳过这类会话；但管理界面仍要能看到最近的对话内容，故保留片段而非丢弃。
 	HistoryTruncated bool `json:"historyTruncated,omitempty"`
+	// ClientPrefixLen 是 ContextHistory 里"客户端逐字发来"的前缀长度，其后是网关
+	// 追加的本轮模型回复。前缀比对只允许用这一段：客户端下一轮必然逐字重发自己
+	// 的消息，而模型回复会被它按自己的格式重新渲染——工具轮尤其明显，客户端回传
+	// 的是 content:null + tool_calls，与网关存下的纯文本对不上，逐字比对必然失配。
+	ClientPrefixLen int `json:"clientPrefixLen,omitempty"`
 }
 
 type sessionResolver struct {
@@ -276,8 +281,12 @@ func (sr *sessionResolver) matchContextLocked(ipFinger string, messages []oaiMsg
 		if sess.HistoryTruncated {
 			continue
 		}
-		n := contextPrefixLen(sess.ContextHistory, messages)
-		if n >= 1 && (n > best.n || (n == best.n && sess.LastUsedAt.After(best.recent))) {
+		n := contextPrefixLen(sess.comparableHistory(), messages)
+		if n < 1 {
+			continue
+		}
+		n = skipAssistantEcho(n, messages)
+		if n > best.n || (n == best.n && sess.LastUsedAt.After(best.recent)) {
 			best = match{id: id, n: n, recent: sess.LastUsedAt}
 		}
 	}
@@ -286,6 +295,31 @@ func (sr *sessionResolver) matchContextLocked(ipFinger string, messages []oaiMsg
 
 // contextPrefixLen 杩斿洖 hist 鏄惁涓ユ牸鏄?msgs 鐨勫墠缂€銆俬ist 涓虹┖鎴栦笉鏄墠缂€
 // 鏃惰繑鍥?0锛涘懡涓椂杩斿洖 len(hist)锛屽嵆澧為噺鍙戦€佽捣鐐广€?
+// comparableHistory 返回可用于逐字比对的那一段历史：客户端自己发来的消息。
+// ClientPrefixLen 为 0 的记录来自旧版本（字段是后加的），此时退回整段历史，
+// 行为与升级前一致。
+func (s sessionBinding) comparableHistory() []oaiMsg {
+	if s.ClientPrefixLen <= 0 || s.ClientPrefixLen > len(s.ContextHistory) {
+		return s.ContextHistory
+	}
+	return s.ContextHistory[:s.ClientPrefixLen]
+}
+
+// skipAssistantEcho 把增量起点推过客户端回传的那条模型回复。
+//
+// 云端对话在客户端消息之后还存着上一轮的模型回复，客户端下一轮会把它回传，
+// 但渲染格式由客户端决定：工具调用轮回传的是 content:null + tool_calls，和网关
+// 存下的纯文本对不上。所以这条消息一律不参与逐字比对，只靠 role 识别并跳过。
+// 不跳过就会把它当成新增内容重新发一遍，云端对话里出现重复的助手轮。
+// 位置上不是 assistant 时（客户端丢弃了回复，或直接追加了新提问）不跳，
+// 否则会吞掉真正的新增消息。
+func skipAssistantEcho(n int, msgs []oaiMsg) int {
+	if n >= 0 && n < len(msgs) && msgs[n].Role == "assistant" {
+		return n + 1
+	}
+	return n
+}
+
 // incrementStart 把"云端已有条数"夹成一个可用的增量起点下标。
 //
 // 上层按 messages[HistoryLen:] 切增量，且只在 HistoryLen < len(messages) 时才切。
@@ -370,6 +404,9 @@ func (sr *sessionResolver) Bind(sessionID, conversationID, accountID string, bod
 
 	now := time.Now().UTC()
 	history, truncated := cloneMessages(body.Messages)
+	// 记录客户端逐字消息的边界，再把本轮回复追加进去。回复只服务于管理界面展示
+	// 与"云端已比客户端多一轮"这个事实，不参与逐字比对。
+	clientPrefixLen := len(history)
 	if strings.TrimSpace(assistantText) != "" {
 		history = append(history, oaiMsg{Role: "assistant", Content: assistantText})
 	}
@@ -389,6 +426,7 @@ func (sr *sessionResolver) Bind(sessionID, conversationID, accountID string, bod
 			sess.ContextFinger = contextFingerprint(history)
 			sess.ContextHistory = history
 			sess.HistoryTruncated = truncated
+			sess.ClientPrefixLen = clientPrefixLen
 			sr.sessions[sessionID] = sess
 			sr.reindexLocked(sess)
 			sr.persist.markDirty()
@@ -405,6 +443,7 @@ func (sr *sessionResolver) Bind(sessionID, conversationID, accountID string, bod
 				sess.ContextFinger = contextFingerprint(history)
 				sess.ContextHistory = history
 				sess.HistoryTruncated = truncated
+				sess.ClientPrefixLen = clientPrefixLen
 				sr.sessions[sid] = sess
 				sr.reindexLocked(sess)
 				sr.persist.markDirty()
@@ -425,6 +464,7 @@ func (sr *sessionResolver) Bind(sessionID, conversationID, accountID string, bod
 		ContextFinger:    contextFingerprint(history),
 		ContextHistory:   history,
 		HistoryTruncated: truncated,
+		ClientPrefixLen:  clientPrefixLen,
 	}
 
 	sr.reindexLocked(sess)
@@ -487,8 +527,10 @@ func (sr *sessionResolver) ConversationPrefixLen(conversationID string, messages
 		if sess.HistoryTruncated {
 			continue
 		}
-		if n := contextPrefixLen(sess.ContextHistory, messages); n > best {
-			best = n
+		if n := contextPrefixLen(sess.comparableHistory(), messages); n >= 1 {
+			if n = skipAssistantEcho(n, messages); n > best {
+				best = n
+			}
 		}
 	}
 	return best, best > 0
