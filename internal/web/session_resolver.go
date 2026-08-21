@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net"
 	"net/http"
 	"os"
@@ -16,8 +17,11 @@ import (
 	"github.com/google/uuid"
 )
 
-// sessionBinding 璁板綍涓€娆″唴瀹归敭澶嶇敤鐨勪細璇濄€侷dentity 瀛楁锛圛P/user锛変粎浣?
-// 璇婃柇鍏冩暟鎹繚鐣欙紝鍖归厤鍒ゅ畾鍙緷璧栦笂涓嬫枃鍐呭锛岃 Resolve 鐨勫唴瀹归敭閫昏緫銆?
+// sessionBinding 记录一次内容键复用的会话。
+//
+// 参与匹配判定的只有两项：IPFingerprint（跨客户端隔离）与 ContextHistory（内容
+// 前缀比对）。UserField 与 ContextFinger 现在只是 /v1/sessions 上的诊断元数据，
+// 没有任何逻辑读取它们——曾经的三个反查索引已连同它们的查询路径一起移除。
 type sessionBinding struct {
 	SessionID      string    `json:"sessionId"`
 	ConversationID string    `json:"conversationId"`
@@ -27,19 +31,19 @@ type sessionBinding struct {
 	IPFingerprint  string    `json:"ipFingerprint,omitempty"`
 	UserField      string    `json:"userField,omitempty"`
 	ContextFinger  string    `json:"contextFinger,omitempty"`
-	// ContextHistory 鎸佷箙鍖栦繚瀛樻渶杩戜竴娆″崗璁殑瀹屾暣娑堟伅锛屼緵閲嶅惎鍚庣户缁仛
-	// 鍐呭鍓嶇紑鍖归厤锛岄伩鍏嶈繘绋嬮噸鍚鑷存墍鏈変細璇濋敭鍏ㄩ儴澶辨晥銆?
+	// ContextHistory 持久化保存最近一次协议的消息，供重启后继续做内容前缀匹配，
+	// 避免进程重启导致所有会话键全部失效。
 	ContextHistory []oaiMsg `json:"contextHistory,omitempty"`
+	// HistoryTruncated 表示 ContextHistory 只是尾部片段（消息数超过 maxContextHistory）。
+	// 片段不是任何消息序列的前缀，拿它做前缀比对会从第一条起就错位，所以匹配路径
+	// 必须跳过这类会话；但管理界面仍要能看到最近的对话内容，故保留片段而非丢弃。
+	HistoryTruncated bool `json:"historyTruncated,omitempty"`
 }
 
 type sessionResolver struct {
 	mu          sync.Mutex
 	path        string
 	sessions    map[string]sessionBinding
-	byExplicit  map[string]string // explicitID -> sessionID
-	byUserField map[string]string // userField -> sessionID
-	byIPFinger  map[string]string // ipFingerprint -> sessionID
-	byContext   map[string]string // contextFingerprint -> sessionID
 	ttl         time.Duration
 	contextTTL  time.Duration
 	maxSessions int
@@ -70,10 +74,6 @@ func openSessionResolver() *sessionResolver {
 	sr := &sessionResolver{
 		path:        path,
 		sessions:    map[string]sessionBinding{},
-		byExplicit:  map[string]string{},
-		byUserField: map[string]string{},
-		byIPFinger:  map[string]string{},
-		byContext:   map[string]string{},
 		ttl:         ttl,
 		contextTTL:  contextTTL,
 		maxSessions: defaultMaxSessions,
@@ -84,17 +84,23 @@ func openSessionResolver() *sessionResolver {
 }
 
 func (sr *sessionResolver) loadLocked() {
-	if b, err := os.ReadFile(sr.path); err == nil {
-		var list []sessionBinding
-		if err := json.Unmarshal(b, &list); err == nil {
-			now := time.Now().UTC()
-			for _, s := range list {
-				if now.Sub(s.LastUsedAt) > sr.ttl {
-					continue
-				}
-				sr.reindexLocked(s)
-			}
+	b, err := os.ReadFile(sr.path)
+	if err != nil {
+		return
+	}
+	var list []sessionBinding
+	if err := json.Unmarshal(b, &list); err != nil {
+		// 该文件曾与 sessionStore 共用同一个环境变量，磁盘上可能留着对象格式的
+		// 旧内容。静默忽略会让人以为绑定丢失是别的原因，这里说明清楚。
+		log.Printf("[session-resolver] ignoring unparsable cache %s: %v", sr.path, err)
+		return
+	}
+	now := time.Now().UTC()
+	for _, s := range list {
+		if now.Sub(s.LastUsedAt) > sr.ttl {
+			continue
 		}
+		sr.reindexLocked(s)
 	}
 }
 
@@ -113,24 +119,19 @@ func (sr *sessionResolver) flush() error {
 	return writeFileAtomic(sr.path, b, 0o600)
 }
 
+// reindexLocked 登记会话。曾经这里还维护 byUserField/byIPFinger/byContext 三个
+// 反查索引，但它们只有写入和删除前的自比较，从来没有任何查询点——匹配逻辑
+// （matchContextLocked）一直是直接遍历 sessions 的。三个 map × 上限 1000 条会话
+// 的常驻开销换不到任何东西，已连同字段一起移除。
 func (sr *sessionResolver) reindexLocked(s sessionBinding) {
 	sr.sessions[s.SessionID] = s
-	if s.UserField != "" {
-		sr.byUserField[s.UserField] = s.SessionID
-	}
-	if s.IPFingerprint != "" {
-		sr.byIPFinger[s.IPFingerprint] = s.SessionID
-	}
-	if s.ContextFinger != "" {
-		sr.byContext[s.ContextFinger] = s.SessionID
-	}
 }
 
 func (sr *sessionResolver) evictLocked() {
 	now := time.Now().UTC()
 	for id, s := range sr.sessions {
 		if now.Sub(s.LastUsedAt) > sr.ttl {
-			sr.dropLocked(id, s)
+			sr.dropLocked(id)
 		}
 	}
 	if len(sr.sessions) > sr.maxSessions {
@@ -143,22 +144,13 @@ func (sr *sessionResolver) evictLocked() {
 		}
 		sort.Slice(ids, func(i, j int) bool { return last[ids[i]].Before(last[ids[j]]) })
 		for _, id := range ids[:len(sr.sessions)-sr.maxSessions] {
-			sr.dropLocked(id, sr.sessions[id])
+			sr.dropLocked(id)
 		}
 	}
 }
 
-func (sr *sessionResolver) dropLocked(id string, s sessionBinding) {
+func (sr *sessionResolver) dropLocked(id string) {
 	delete(sr.sessions, id)
-	if sr.byUserField[s.UserField] == id {
-		delete(sr.byUserField, s.UserField)
-	}
-	if sr.byIPFinger[s.IPFingerprint] == id {
-		delete(sr.byIPFinger, s.IPFingerprint)
-	}
-	if sr.byContext[s.ContextFinger] == id {
-		delete(sr.byContext, s.ContextFinger)
-	}
 }
 
 type ResolveResult struct {
@@ -205,35 +197,29 @@ func (sr *sessionResolver) Resolve(r *http.Request, body *oaiReq) ResolveResult 
 
 	explicitID := r.Header.Get("X-M365-Session-Id")
 
-	// 瀹㈡埛绔樉寮忔寚瀹氱殑浼氳瘽 ID 鏄渶楂樹紭鍏堢殑缁帴璇箟锛氫笉鍙備笌浠讳綍韬唤鍒ゅ畾锛?
-	// 鐢辫皟鐢ㄦ柟涓诲姩鍐冲畾瑕佺户缁摢涓簯绔璇濄€?
+	// 客户端显式指定的会话 ID 是最高优先级的续接语义：不参与任何身份判定，
+	// 由调用方主动决定要继续哪个云端对话。Bind 在 sessionID 为空时直接用这个
+	// 头值当会话主键，所以按主键查一次即可。这里曾经还套了一层 byExplicit 索引，
+	// 但那个 map 从未有过写入点、恒为空，查询永远走不到，已连同字段一起移除。
 	if explicitID != "" {
-		if sessID, ok := sr.byExplicit[explicitID]; ok {
-			if sess, ok := sr.sessions[sessID]; ok {
-				sess.LastUsedAt = time.Now().UTC()
-				sr.sessions[sessID] = sess
-				sr.persist.markDirty()
-				return ResolveResult{
-					SessionID:      sess.SessionID,
-					ConversationID: sess.ConversationID,
-					AccountID:      sess.AccountID,
-					MatchedBy:      "explicit",
-					IsNew:          false,
-					HistoryLen:     len(sess.ContextHistory),
-				}
-			}
-		}
 		if sess, ok := sr.sessions[explicitID]; ok {
 			sess.LastUsedAt = time.Now().UTC()
 			sr.sessions[explicitID] = sess
 			sr.persist.markDirty()
+			// 历史被截断过时 len(ContextHistory) 不等于云端已有的条数，拿它当增量
+			// 起点会切错位置。此时返回 0，让上层发送全量而不是错位的增量。
+			historyLen := len(sess.ContextHistory)
+			if sess.HistoryTruncated {
+				historyLen = 0
+			}
+			historyLen = incrementStart(historyLen, len(body.Messages))
 			return ResolveResult{
 				SessionID:      sess.SessionID,
 				ConversationID: sess.ConversationID,
 				AccountID:      sess.AccountID,
 				MatchedBy:      "explicit",
 				IsNew:          false,
-				HistoryLen:     len(sess.ContextHistory),
+				HistoryLen:     historyLen,
 			}
 		}
 	}
@@ -253,75 +239,17 @@ func (sr *sessionResolver) Resolve(r *http.Request, body *oaiReq) ResolveResult 
 			AccountID:      sess.AccountID,
 			MatchedBy:      fmt.Sprintf("context_prefix_%d", n),
 			IsNew:          false,
-			HistoryLen:     n,
+			HistoryLen:     incrementStart(n, len(body.Messages)),
 		}
 	}
 
-	// 寮辩害鏉熷厹搴曪細鍐呭涓嶆瀯鎴愪弗鏍煎墠缂€锛屼絾涓庢煇涓巻鍙查珮搴︾浉浼硷紙濡傚鎴风
-	// 鏈湴鎴柇浜嗗巻鍙诧級锛屼粛澶嶇敤璇ヤ細璇濄€傛鏃跺閲忚竟鐣屾湭鐭ワ紝涓婂眰鍙戦€佸叏閲忋€?
-	suffixID, suffixN := sr.matchSuffixLocked(ipFinger, body.Messages)
-	if suffixID != "" {
-		sess := sr.sessions[suffixID]
-		sess.LastUsedAt = time.Now().UTC()
-		sr.sessions[suffixID] = sess
-		sr.persist.markDirty()
-		return ResolveResult{
-			SessionID:      sess.SessionID,
-			ConversationID: sess.ConversationID,
-			AccountID:      sess.AccountID,
-			MatchedBy:      fmt.Sprintf("context_suffix_%d", suffixN),
-			IsNew:          false,
-			HistoryLen:     suffixN,
-		}
-	}
+	// 内容不构成严格前缀时一律新建会话。历史上这里还有一层"后缀匹配"兜底
+	// （客户端本地截断历史后仍复用该会话），但后缀命中意味着云端已有的消息
+	// 落在客户端消息序列的中间或末尾，而增量发送只能表达"跳过前 N 条"这一种
+	// 形状。任何 HistoryLen 取值都会导致重复发送或丢掉开头的 system 提示，
+	// 因此该路径已移除：宁可多花一次建对话的延迟，也不交付错误的上下文。
 
 	return ResolveResult{IsNew: true}
-}
-
-func (sr *sessionResolver) matchSuffixLocked(ipFinger string, messages []oaiMsg) (string, int) {
-	if len(messages) < 2 {
-		return "", 0
-	}
-	type match struct {
-		id     string
-		n      int
-		recent time.Time
-	}
-	best := match{}
-	minSuffix := 2
-	for id, sess := range sr.sessions {
-		if time.Since(sess.LastUsedAt) > sr.contextTTL {
-			continue
-		}
-		if sess.IPFingerprint != ipFinger {
-			continue
-		}
-		hist := sess.ContextHistory
-		if len(hist) < minSuffix {
-			continue
-		}
-		n := suffixMatchLen(hist, messages)
-		if n >= minSuffix && (n > best.n || (n == best.n && sess.LastUsedAt.After(best.recent))) {
-			best = match{id: id, n: n, recent: sess.LastUsedAt}
-		}
-	}
-	return best.id, best.n
-}
-
-func suffixMatchLen(hist, msgs []oaiMsg) int {
-	maxN := len(hist)
-	if maxN > len(msgs) {
-		maxN = len(msgs)
-	}
-	n := 0
-	for i := 1; i <= maxN; i++ {
-		if messagesEqual(hist[len(hist)-i], msgs[len(msgs)-i]) {
-			n = i
-		} else {
-			break
-		}
-	}
-	return n
 }
 
 // matchContextLocked 浠庡叏閮ㄤ細璇濅腑鎵惧埌鍏?contextHistory 涓ユ牸浣滀负娑堟伅鍓嶇紑鐨?
@@ -344,6 +272,10 @@ func (sr *sessionResolver) matchContextLocked(ipFinger string, messages []oaiMsg
 		if sess.IPFingerprint != ipFinger {
 			continue
 		}
+		// 截断的历史只是尾部片段，不是任何消息序列的前缀，比对必然从第一条起错位。
+		if sess.HistoryTruncated {
+			continue
+		}
 		n := contextPrefixLen(sess.ContextHistory, messages)
 		if n >= 1 && (n > best.n || (n == best.n && sess.LastUsedAt.After(best.recent))) {
 			best = match{id: id, n: n, recent: sess.LastUsedAt}
@@ -354,6 +286,25 @@ func (sr *sessionResolver) matchContextLocked(ipFinger string, messages []oaiMsg
 
 // contextPrefixLen 杩斿洖 hist 鏄惁涓ユ牸鏄?msgs 鐨勫墠缂€銆俬ist 涓虹┖鎴栦笉鏄墠缂€
 // 鏃惰繑鍥?0锛涘懡涓椂杩斿洖 len(hist)锛屽嵆澧為噺鍙戦€佽捣鐐广€?
+// incrementStart 把"云端已有条数"夹成一个可用的增量起点下标。
+//
+// 上层按 messages[HistoryLen:] 切增量，且只在 HistoryLen < len(messages) 时才切。
+// 当已有条数等于消息总数时（客户端发来的内容被云端对话完整包含，没有新增），
+// 原样返回会落到那个守卫之外，于是整段历史被重新灌进一个已存着同样内容的对话，
+// 造成上下文重复。这里夹到 len-1：至少留一条作为增量，把重复限制在一条消息内。
+func incrementStart(historyLen, total int) int {
+	if total <= 0 {
+		return 0
+	}
+	if historyLen >= total {
+		return total - 1
+	}
+	if historyLen < 0 {
+		return 0
+	}
+	return historyLen
+}
+
 func contextPrefixLen(hist, msgs []oaiMsg) int {
 	if len(hist) == 0 || len(msgs) < len(hist) {
 		return 0
@@ -407,23 +358,18 @@ func toolCallEqual(x, y map[string]any) bool {
 	return xa == ya
 }
 
-func (sr *sessionResolver) Bind(sessionID, conversationID, accountID string, body *oaiReq, args ...any) {
-	var assistantText string
-	var r *http.Request
-	for _, arg := range args {
-		switch value := arg.(type) {
-		case string:
-			assistantText = value
-		case *http.Request:
-			r = value
-		}
-	}
+// Bind 登记一轮完成的对话。assistantText 必须是模型这一轮的回复：它会作为
+// assistant 消息追加进 ContextHistory，客户端下一轮回传同一条回复时前缀比对
+// 才能命中。这里曾用 args ...any + 类型 switch 取参，调用方误传请求侧的 flatten
+// 文本也不会报错，历史末项因此长期是请求文本的副本、复用永不命中。签名改为
+// 显式参数，让这类错传变成编译错误。
+func (sr *sessionResolver) Bind(sessionID, conversationID, accountID string, body *oaiReq, assistantText string, r *http.Request) {
 	sr.mu.Lock()
 	defer sr.mu.Unlock()
 	sr.evictLocked()
 
 	now := time.Now().UTC()
-	history := cloneMessages(body.Messages)
+	history, truncated := cloneMessages(body.Messages)
 	if strings.TrimSpace(assistantText) != "" {
 		history = append(history, oaiMsg{Role: "assistant", Content: assistantText})
 	}
@@ -442,6 +388,7 @@ func (sr *sessionResolver) Bind(sessionID, conversationID, accountID string, bod
 			sess.IPFingerprint = clientIPFingerprint(r)
 			sess.ContextFinger = contextFingerprint(history)
 			sess.ContextHistory = history
+			sess.HistoryTruncated = truncated
 			sr.sessions[sessionID] = sess
 			sr.reindexLocked(sess)
 			sr.persist.markDirty()
@@ -457,6 +404,7 @@ func (sr *sessionResolver) Bind(sessionID, conversationID, accountID string, bod
 				sess.IPFingerprint = clientIPFingerprint(r)
 				sess.ContextFinger = contextFingerprint(history)
 				sess.ContextHistory = history
+				sess.HistoryTruncated = truncated
 				sr.sessions[sid] = sess
 				sr.reindexLocked(sess)
 				sr.persist.markDirty()
@@ -467,15 +415,16 @@ func (sr *sessionResolver) Bind(sessionID, conversationID, accountID string, bod
 	}
 
 	sess := sessionBinding{
-		SessionID:      sessionID,
-		ConversationID: conversationID,
-		AccountID:      accountID,
-		CreatedAt:      now,
-		LastUsedAt:     now,
-		IPFingerprint:  clientIPFingerprint(r),
-		UserField:      body.User,
-		ContextFinger:  contextFingerprint(history),
-		ContextHistory: history,
+		SessionID:        sessionID,
+		ConversationID:   conversationID,
+		AccountID:        accountID,
+		CreatedAt:        now,
+		LastUsedAt:       now,
+		IPFingerprint:    clientIPFingerprint(r),
+		UserField:        body.User,
+		ContextFinger:    contextFingerprint(history),
+		ContextHistory:   history,
+		HistoryTruncated: truncated,
 	}
 
 	sr.reindexLocked(sess)
@@ -494,7 +443,11 @@ func (sr *sessionResolver) GetConversation(conversationID string) (sessionBindin
 	defer sr.mu.Unlock()
 	for _, session := range sr.sessions {
 		if session.ConversationID == conversationID {
-			session.ContextHistory = cloneMessages(session.ContextHistory)
+			// 防御性拷贝，避免调用方改到锁内的切片。这里不能复用 cloneMessages：
+			// 它带 maxContextHistory 上限，会把已经存好的历史再截一次。
+			out := make([]oaiMsg, len(session.ContextHistory))
+			copy(out, session.ContextHistory)
+			session.ContextHistory = out
 			return session, true
 		}
 	}
@@ -514,24 +467,40 @@ func (sr *sessionResolver) ListSessions() []sessionBinding {
 	return out
 }
 
+// ConversationPrefixLen 判断 messages 是否以该云端对话已有的历史为严格前缀，
+// 命中时返回云端已有的消息条数（即增量发送的起点下标）。
+//
+// 供那些只知道"该复用哪个对话"、却不知道云端已有什么内容的复用路径使用
+// （例如按 user 字段索引的映射）。查不到历史或内容不构成前缀时返回 (0,false)：
+// 此时必须放弃复用，因为猜错增量边界会把已有历史重发一遍或漏掉开头几条。
+func (sr *sessionResolver) ConversationPrefixLen(conversationID string, messages []oaiMsg) (int, bool) {
+	if conversationID == "" || len(messages) == 0 {
+		return 0, false
+	}
+	sr.mu.Lock()
+	defer sr.mu.Unlock()
+	best := 0
+	for _, sess := range sr.sessions {
+		if sess.ConversationID != conversationID {
+			continue
+		}
+		if sess.HistoryTruncated {
+			continue
+		}
+		if n := contextPrefixLen(sess.ContextHistory, messages); n > best {
+			best = n
+		}
+	}
+	return best, best > 0
+}
+
 func (sr *sessionResolver) DeleteSession(sessionID string) bool {
 	sr.mu.Lock()
 	defer sr.mu.Unlock()
-	s, ok := sr.sessions[sessionID]
-	if !ok {
+	if _, ok := sr.sessions[sessionID]; !ok {
 		return false
 	}
-	delete(sr.sessions, sessionID)
-	delete(sr.byExplicit, sessionID)
-	if s.UserField != "" {
-		delete(sr.byUserField, s.UserField)
-	}
-	if s.IPFingerprint != "" {
-		delete(sr.byIPFinger, s.IPFingerprint)
-	}
-	if s.ContextFinger != "" {
-		delete(sr.byContext, s.ContextFinger)
-	}
+	sr.dropLocked(sessionID)
 	sr.persist.markDirty()
 	return true
 }
@@ -547,17 +516,7 @@ func (sr *sessionResolver) UnbindByConversation(conversationID string) int {
 		if s.ConversationID != conversationID {
 			continue
 		}
-		delete(sr.sessions, sid)
-		delete(sr.byExplicit, sid)
-		if s.UserField != "" {
-			delete(sr.byUserField, s.UserField)
-		}
-		if s.IPFingerprint != "" {
-			delete(sr.byIPFinger, s.IPFingerprint)
-		}
-		if s.ContextFinger != "" {
-			delete(sr.byContext, s.ContextFinger)
-		}
+		sr.dropLocked(sid)
 		removed++
 	}
 	if removed > 0 {
@@ -566,11 +525,24 @@ func (sr *sessionResolver) UnbindByConversation(conversationID string) int {
 	return removed
 }
 
-func cloneMessages(msgs []oaiMsg) []oaiMsg {
-	if len(msgs) > 128 {
-		msgs = msgs[len(msgs)-128:]
+// maxContextHistory 限制单条会话在内存/磁盘上保留的消息条数。上限存在的原因是
+// 1000 条会话 × 完整历史会把常驻内存推到不可接受的量级。
+const maxContextHistory = 128
+
+// cloneMessages 复制消息用于会话历史，第二个返回值表示是否发生了截断。
+//
+// 超限时保留尾部片段并标记 truncated：片段对前缀比对毫无用处（contextPrefixLen
+// 会从第一条起就失配），所以匹配路径必须靠这个标记跳过该会话；但管理界面的对话
+// 详情要靠这份历史展示内容，整条丢弃会让超长对话在界面上变成 0 条消息。
+// 于是分开处理：留着给人看，标记起来不给匹配用。
+func cloneMessages(msgs []oaiMsg) ([]oaiMsg, bool) {
+	truncated := false
+	if len(msgs) > maxContextHistory {
+		log.Printf("[session-resolver] history %d exceeds cap %d, keeping tail for display and excluding this session from prefix matching", len(msgs), maxContextHistory)
+		msgs = msgs[len(msgs)-maxContextHistory:]
+		truncated = true
 	}
 	out := make([]oaiMsg, len(msgs))
 	copy(out, msgs)
-	return out
+	return out, truncated
 }

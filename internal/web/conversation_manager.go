@@ -108,19 +108,27 @@ func (cm *conversationManager) flush() error {
 	return writeFileAtomic(cm.path, b, 0o600)
 }
 
+// Record 登记一轮用过的云端对话。同一对话多轮复用时只刷新 LastUsedAt：
+// 整条覆盖会把 CreatedAt 也重置成当前时间，max_age 模式按 CreatedAt 判定过期，
+// 于是持续活跃的对话永远不会被回收。
 func (cm *conversationManager) Record(conversationID, accountID, title string) {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 	now := time.Now().UTC()
-	cm.data[conversationID] = managedConversation{
-		ID:         conversationID,
-		AccountID:  accountID,
-		CreatedAt:  now,
-		LastUsedAt: now,
-		Title:      title,
+	entry, exists := cm.data[conversationID]
+	if !exists {
+		entry = managedConversation{ID: conversationID, CreatedAt: now}
 	}
+	entry.AccountID = accountID
+	entry.LastUsedAt = now
+	if title != "" {
+		entry.Title = title
+	}
+	cm.data[conversationID] = entry
 	cm.persist.markDirty()
-	log.Printf("[conversation-manager] recorded conversation %s", conversationID)
+	if !exists {
+		log.Printf("[conversation-manager] recorded conversation %s", conversationID)
+	}
 }
 
 func (cm *conversationManager) Whitelist(conversationID string) {

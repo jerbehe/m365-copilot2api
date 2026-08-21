@@ -23,9 +23,9 @@ func TestConversationListAndDetailUseCompleteLocalHistory(t *testing.T) {
 	}
 	s := &Server{tokens: store, sessionResolver: openSessionResolver()}
 
-	oldCloudClient := m365CloudClient
-	m365CloudClient = nil
-	defer func() { m365CloudClient = oldCloudClient }()
+	oldPool := m365CloudClients
+	m365CloudClients = nil
+	defer func() { m365CloudClients = oldPool }()
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
 	req.Header.Set(sessionHeaderName, "session-detail")

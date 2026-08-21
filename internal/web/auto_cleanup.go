@@ -54,9 +54,21 @@ func (s *Server) StartAutoCleanup() {
 }
 
 func (s *Server) autoCleanupOnce(maxAge time.Duration, keepN int) {
-	if m365CloudClient == nil {
+	if !cloudConfigured() {
 		return
 	}
+	// 每个账号的云端对话列表相互独立，且只能用该账号自己的 token 删除，
+	// 所以逐账号处理；keepN 是每账号的保留额度。
+	for _, accountID := range m365CloudClients.AccountIDs() {
+		client, ok := m365CloudClients.Get(accountID)
+		if !ok {
+			continue
+		}
+		s.autoCleanupAccount(accountID, client, maxAge, keepN)
+	}
+}
+
+func (s *Server) autoCleanupAccount(accountID string, client *M365CloudClient, maxAge time.Duration, keepN int) {
 	now := time.Now()
 	active := s.activeConversationSet(maxAge)
 
@@ -66,9 +78,9 @@ func (s *Server) autoCleanupOnce(maxAge time.Duration, keepN int) {
 	}
 	deleted := 0
 	for round := 0; round < 100; round++ {
-		chats, err := m365CloudClient.ListConversations()
+		chats, err := client.ListConversations()
 		if err != nil {
-			log.Printf("[auto-cleanup] list failed: %v", err)
+			log.Printf("[auto-cleanup] list failed account=%s: %v", accountID, err)
 			return
 		}
 		if len(chats) == 0 {
@@ -100,7 +112,7 @@ func (s *Server) autoCleanupOnce(maxAge time.Duration, keepN int) {
 
 		anyDeleted := false
 		for _, c := range stale {
-			if err := m365CloudClient.DeleteConversation(c.id); err != nil {
+			if err := client.DeleteConversation(c.id); err != nil {
 				log.Printf("[auto-cleanup] delete %s failed: %v", c.id, err)
 				continue
 			}
@@ -111,7 +123,7 @@ func (s *Server) autoCleanupOnce(maxAge time.Duration, keepN int) {
 		sort.Slice(rest, func(i, j int) bool { return rest[i].createMs < rest[j].createMs })
 		for i := keepN; i < len(rest); i++ {
 			c := rest[i]
-			if err := m365CloudClient.DeleteConversation(c.id); err != nil {
+			if err := client.DeleteConversation(c.id); err != nil {
 				log.Printf("[auto-cleanup] delete %s failed: %v", c.id, err)
 				continue
 			}
@@ -124,7 +136,7 @@ func (s *Server) autoCleanupOnce(maxAge time.Duration, keepN int) {
 		}
 	}
 	if deleted > 0 {
-		log.Printf("[auto-cleanup] removed %d idle conversations", deleted)
+		log.Printf("[auto-cleanup] removed %d idle conversations account=%s", deleted, accountID)
 	}
 }
 

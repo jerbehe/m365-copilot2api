@@ -5,7 +5,10 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"m365-copilot2api/internal/auth"
 	"net/http"
+	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -13,29 +16,39 @@ import (
 )
 
 type M365CloudClient struct {
-	mu           sync.Mutex
-	clientID     string
-	tenantID     string
-	refreshToken string
-	accessToken  string
-	expiresAt    time.Time
-	httpClient   *http.Client
+	mu          sync.Mutex
+	clientID    string
+	tenantID    string
+	accessToken string
+	expiresAt   time.Time
+	httpClient  *http.Client
+
+	// creds 每次刷新前从账号存储读取当前 refresh token，refreshed 在换到新的
+	// refresh token 后回写。微软的 refresh token 是滚动的：启动时快照一份自用，
+	// 会与账号存储各自演进，其中一份迟早失效并让云端对话接口开始返回 401。
+	creds     func() string
+	refreshed func(string)
 }
 
 func NewM365CloudClient(clientID, tenantID, refreshToken string) *M365CloudClient {
+	token := refreshToken
 	return &M365CloudClient{
-		clientID:     clientID,
-		tenantID:     tenantID,
-		refreshToken: refreshToken,
-		httpClient:   &http.Client{Timeout: 30 * time.Second},
+		clientID:   clientID,
+		tenantID:   tenantID,
+		httpClient: &http.Client{Timeout: 30 * time.Second},
+		creds:      func() string { return token },
+		refreshed:  func(s string) { token = s },
 	}
 }
 
-func (c *M365CloudClient) updateRefreshToken(newToken string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if newToken != "" && newToken != c.refreshToken {
-		c.refreshToken = newToken
+// NewM365CloudClientWithStore 让 client 与账号存储共用同一份 refresh token。
+func NewM365CloudClientWithStore(clientID, tenantID string, creds func() string, refreshed func(string)) *M365CloudClient {
+	return &M365CloudClient{
+		clientID:   clientID,
+		tenantID:   tenantID,
+		httpClient: &http.Client{Timeout: 30 * time.Second},
+		creds:      creds,
+		refreshed:  refreshed,
 	}
 }
 
@@ -55,15 +68,22 @@ func (c *M365CloudClient) getAccessToken() (string, error) {
 		return c.accessToken, nil
 	}
 
-	payload := fmt.Sprintf(
-		"client_id=%s&refresh_token=%s&grant_type=refresh_token&scope=https://m365.cloud.microsoft/v2/.default",
-		c.clientID, c.refreshToken,
-	)
+	refreshToken := c.creds()
+	if strings.TrimSpace(refreshToken) == "" {
+		return "", fmt.Errorf("no refresh token available for account")
+	}
+
+	payload := url.Values{
+		"client_id":     {c.clientID},
+		"refresh_token": {refreshToken},
+		"grant_type":    {"refresh_token"},
+		"scope":         {"https://m365.cloud.microsoft/v2/.default"},
+	}.Encode()
 
 	resp, err := c.httpClient.Post(
 		fmt.Sprintf("https://login.microsoftonline.com/%s/oauth2/v2.0/token", c.tenantID),
 		"application/x-www-form-urlencoded",
-		io.NopCloser(stringReader(payload)),
+		strings.NewReader(payload),
 	)
 	if err != nil {
 		return "", fmt.Errorf("token refresh: %w", err)
@@ -86,13 +106,15 @@ func (c *M365CloudClient) getAccessToken() (string, error) {
 		return "", fmt.Errorf("parse token response: %w", err)
 	}
 	if result.Error != "" {
+		// 旧 token 已被上游拒绝，清掉缓存的 access token，避免继续拿它发请求。
+		c.accessToken = ""
 		return "", fmt.Errorf("token error: %s - %s", result.Error, result.ErrorDesc)
 	}
 
 	c.accessToken = result.AccessToken
 	c.expiresAt = time.Now().Add(time.Duration(result.ExpiresIn) * time.Second)
-	if result.RefreshToken != "" {
-		c.refreshToken = result.RefreshToken
+	if result.RefreshToken != "" && result.RefreshToken != refreshToken {
+		c.refreshed(result.RefreshToken)
 	}
 
 	log.Printf("[m365-cloud] token refreshed, expires in %ds", result.ExpiresIn)
@@ -120,7 +142,7 @@ func (c *M365CloudClient) doAPI(action string, payload map[string]any) (map[stri
 		return nil, fmt.Errorf("marshal request: %w", err)
 	}
 
-	req, err := http.NewRequest("POST", "https://m365.cloud.microsoft/chat", io.NopCloser(stringReader(string(jsonBody))))
+	req, err := http.NewRequest("POST", "https://m365.cloud.microsoft/chat", strings.NewReader(string(jsonBody)))
 	if err != nil {
 		return nil, fmt.Errorf("create request: %w", err)
 	}
@@ -290,22 +312,131 @@ func (c *M365CloudClient) CleanupOldConversations(maxAge time.Duration, keepN in
 	return deleted, nil
 }
 
-type stringReader string
+// stringReader 曾是个无游标的 io.Reader：每次 Read 都从字符串开头 copy，
+// 当 payload 超过写入缓冲（io.Copy 默认 32KB）时会把前 32KB 反复发送。
+// 已全部替换为 strings.NewReader，这里不再保留该类型。
 
-func (s stringReader) Read(p []byte) (int, error) {
-	n := copy(p, s)
-	if n >= len(s) {
-		return n, io.EOF
+// m365CloudPool 按账号持有云端对话客户端。云端对话属于创建它的账号，用别的
+// 账号的 token 去删只会失败，因此列举与删除都必须走对应账号的客户端。
+type m365CloudPool struct {
+	mu      sync.Mutex
+	clients map[string]*M365CloudClient
+	build   func(accountID string) (*M365CloudClient, bool)
+	order   func() []string
+}
+
+// Get 返回该账号的客户端，惰性创建。
+func (p *m365CloudPool) Get(accountID string) (*M365CloudClient, bool) {
+	if p == nil || accountID == "" {
+		return nil, false
 	}
-	return n, nil
+	p.mu.Lock()
+	if c, ok := p.clients[accountID]; ok {
+		p.mu.Unlock()
+		return c, true
+	}
+	p.mu.Unlock()
+
+	c, ok := p.build(accountID)
+	if !ok {
+		return nil, false
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if existing, ok := p.clients[accountID]; ok {
+		return existing, true
+	}
+	p.clients[accountID] = c
+	return c, true
 }
 
-var m365CloudClient *M365CloudClient
-
-func InitM365CloudClient(clientID, tenantID, refreshToken string) {
-	m365CloudClient = NewM365CloudClient(clientID, tenantID, refreshToken)
+// Any 返回任意一个可用客户端，供不带账号信息的调用兜底。
+func (p *m365CloudPool) Any() (*M365CloudClient, bool) {
+	if p == nil {
+		return nil, false
+	}
+	for _, id := range p.AccountIDs() {
+		if c, ok := p.Get(id); ok {
+			return c, true
+		}
+	}
+	return nil, false
 }
 
+// AccountIDs 列出当前所有账号 ID，供需要遍历全部账号的清理逻辑使用。
+func (p *m365CloudPool) AccountIDs() []string {
+	if p == nil || p.order == nil {
+		return nil
+	}
+	return p.order()
+}
+
+var m365CloudClients *m365CloudPool
+
+// InitM365CloudPool 用账号存储装配客户端池：凭据每次现取，刷新后回写，
+// 每个账号一个独立客户端。
+func InitM365CloudPool(store *auth.Store, defaultClientID string) {
+	m365CloudClients = &m365CloudPool{
+		clients: map[string]*M365CloudClient{},
+		order: func() []string {
+			accounts := store.List()
+			ids := make([]string, 0, len(accounts))
+			for _, a := range accounts {
+				ids = append(ids, a.ID)
+			}
+			return ids
+		},
+		build: func(accountID string) (*M365CloudClient, bool) {
+			acc, ok := store.Get(accountID)
+			if !ok {
+				return nil, false
+			}
+			tid := acc.TID
+			if tid == "" {
+				if _, t := extractOIDTID(acc.AccessToken); t != "" {
+					tid = t
+				}
+			}
+			if tid == "" {
+				log.Printf("[m365-cloud] account %s has no tenant id, cloud conversation API unavailable", acc.Email)
+				return nil, false
+			}
+			clientID := firstNonEmpty(os.Getenv("M365_CLIENT_ID"), acc.ClientID, defaultClientID)
+			id := accountID
+			return NewM365CloudClientWithStore(clientID, tid,
+				func() string {
+					if cur, ok := store.Get(id); ok {
+						return cur.RefreshToken
+					}
+					return ""
+				},
+				func(newToken string) {
+					if err := store.UpdateRefreshToken(id, newToken); err != nil {
+						log.Printf("[m365-cloud] persist rotated refresh token for %s failed: %v", id, err)
+					}
+				},
+			), true
+		},
+	}
+	log.Printf("[m365-cloud] client pool initialized for %d account(s)", len(m365CloudClients.AccountIDs()))
+}
+
+// GetM365CloudClient 返回任意可用客户端，仅供无账号上下文的旧调用点使用。
 func GetM365CloudClient() *M365CloudClient {
-	return m365CloudClient
+	c, _ := m365CloudClients.Any()
+	return c
+}
+
+// cloudClientFor 返回指定账号的客户端；账号未知时退回任意可用客户端。
+func cloudClientFor(accountID string) (*M365CloudClient, bool) {
+	if c, ok := m365CloudClients.Get(accountID); ok {
+		return c, true
+	}
+	return m365CloudClients.Any()
+}
+
+// cloudConfigured 表示至少有一个账号可以操作云端对话。
+func cloudConfigured() bool {
+	_, ok := m365CloudClients.Any()
+	return ok
 }

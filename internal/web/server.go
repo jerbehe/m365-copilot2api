@@ -47,7 +47,6 @@ type Server struct {
 	tokens              *auth.Store
 	accountPool         *accountHealth
 	accountConcurrency  *accountConcurrency
-	convCache           *conversationCache
 	generatedImages     map[string]generatedImage
 	pkce                map[string]pendingPKCE
 	chat                *chathub.Client
@@ -116,7 +115,6 @@ func New() (*Server, error) {
 		tokens:             store,
 		accountPool:        newAccountHealth(),
 		accountConcurrency: newAccountConcurrency(),
-		convCache:          newConversationCache(),
 		generatedImages:    map[string]generatedImage{},
 		pkce:               map[string]pendingPKCE{},
 		chat: func() *chathub.Client {
@@ -140,21 +138,10 @@ func New() (*Server, error) {
 	}, nil
 }
 
+// InitM365CloudClient 装配按账号隔离的云端对话客户端池。云端对话归属创建它的
+// 账号，用别的账号的 token 删除只会失败，所以这里不能退化成单账号快照。
 func (s *Server) InitM365CloudClient() {
-	accounts := s.tokens.List()
-	if len(accounts) == 0 {
-		return
-	}
-	acc := accounts[0]
-	clientID := os.Getenv("M365_CLIENT_ID")
-	if clientID == "" {
-		clientID = acc.ClientID
-	}
-	if clientID == "" {
-		clientID = auth.DefaultClientID
-	}
-	InitM365CloudClient(clientID, acc.TID, acc.RefreshToken)
-	log.Printf("[m365-cloud] client initialized for account %s", acc.Email)
+	InitM365CloudPool(s.tokens, auth.DefaultClientID)
 }
 
 func (s *Server) Routes() http.Handler {
@@ -981,13 +968,18 @@ func (s *Server) chatOnce(w http.ResponseWriter, r *http.Request) {
 
 // dropTransientConversation 异步删除 router/repair 轮创建的一次性云端对话，
 // 避免每请求都往 M365 对话列表塞一条记录。删除失败不阻塞请求，留给 auto_cleanup 兜底。
-func (s *Server) dropTransientConversation(conversationID string) {
-	if conversationID == "" || m365CloudClient == nil {
+// accountID 必传：云端对话归属创建它的账号，拿别的账号的 token 去删只会失败。
+func (s *Server) dropTransientConversation(accountID, conversationID string) {
+	if conversationID == "" {
+		return
+	}
+	client, ok := cloudClientFor(accountID)
+	if !ok {
 		return
 	}
 	go func(id string) {
-		if err := m365CloudClient.DeleteConversation(id); err != nil {
-			log.Printf("[transient-conv] delete failed id=%s err=%v", id, err)
+		if err := client.DeleteConversation(id); err != nil {
+			log.Printf("[transient-conv] delete failed account=%s id=%s err=%v", accountID, id, err)
 		}
 	}(conversationID)
 }
@@ -1228,18 +1220,38 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			body.SessionID = firstNonEmpty(body.SessionID, v.SessionID)
 		}
 	}
-	if body.User != "" && body.ConversationID == "" {
-		if us, ok := s.userSessions.Get(body.User); ok {
-			body.AccountID = firstNonEmpty(body.AccountID, us.AccountID)
-			body.ConversationID = us.ConversationID
-			body.SessionID = us.SessionID
-			log.Printf("[user-session] hit user=%s conversation=%s session=%s", body.User, us.ConversationID, us.SessionID)
-		}
-	}
 	// 内容键会话复用：命中后云端对话已存全量历史，只需把客户端新增的
 	// 消息拼成增量 prompt 发送（对齐 DeepSeek 上下文缓存语义）。
 	answerPrompt := prompt
-	if body.ConversationID == "" && len(body.Messages) > 0 {
+	// user 字段映射只回答"复用哪个对话"，不含云端已有内容的信息。命中后必须
+	// 用会话历史核对增量边界：不核对就直接复用，会把全量历史重发进一个已经
+	// 存有同样历史的云端对话，模型看到的是重复上下文。核对不上就放弃复用。
+	if body.User != "" && body.ConversationID == "" && conversationReuseEnabled() {
+		if us, ok := s.userSessions.Get(body.User); ok {
+			if n, verified := s.sessionResolver.ConversationPrefixLen(us.ConversationID, body.Messages); verified {
+				// 与 Resolve 走同一条夹取规则：n 等于消息总数时不能原样使用，
+				// 否则下面的守卫不成立，整段历史会被重发进已有同样内容的对话。
+				n = incrementStart(n, len(body.Messages))
+				body.AccountID = firstNonEmpty(body.AccountID, us.AccountID)
+				body.ConversationID = us.ConversationID
+				body.SessionID = us.SessionID
+				log.Printf("[user-session] hit user=%s conversation=%s session=%s history=%d total=%d", body.User, us.ConversationID, us.SessionID, n, len(body.Messages))
+				if n < len(body.Messages) {
+					incPrompt, incAtt := flattenPromptMessages(body.Messages[n:], nil)
+					if incPrompt = strings.TrimSpace(incPrompt); incPrompt != "" {
+						answerPrompt = incPrompt
+						body.Attachments = incAtt
+					}
+				}
+			} else {
+				// 映射还在但内容对不上（新话题、客户端压缩过上下文），
+				// 沿用它只会串到旧上下文里。丢弃映射，走下面的内容键判定。
+				log.Printf("[user-session] stale user=%s conversation=%s dropped: content is not a prefix of the cloud history", body.User, us.ConversationID)
+				s.userSessions.Delete(body.User)
+			}
+		}
+	}
+	if body.ConversationID == "" && len(body.Messages) > 0 && conversationReuseEnabled() {
 		resolved := s.sessionResolver.Resolve(r, &body)
 		if !resolved.IsNew {
 			body.ConversationID = resolved.ConversationID
@@ -1274,32 +1286,14 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Conversation cache: reuse existing M365 conversation for same account+model
-	// to avoid re-processing full system prompt + history each request (latency
-	// drops from 3-5s to ~1s). Only kicks in when no explicit conversation ID
-	// was provided by client, session key, user session, or session resolver.
-	convReused := false
-	convCacheModel := firstNonEmpty(body.Model, "m365-copilot")
-	if body.ConversationID == "" && len(body.Messages) > 1 {
-		sysHash := systemPromptHash(body.Messages)
-		if cached := s.convCache.Lookup(acc.ID, convCacheModel); cached != nil && cached.SystemPrompt == sysHash {
-			if len(body.Messages) > cached.MessageCount {
-				incPrompt, incAtt := flattenPromptMessages(body.Messages[cached.MessageCount:], nil)
-				incPrompt = strings.TrimSpace(incPrompt)
-				if incPrompt != "" {
-					body.ConversationID = cached.ConversationID
-					body.SessionID = cached.SessionID
-					answerPrompt = incPrompt
-					body.Attachments = incAtt
-					convReused = true
-					log.Printf("[conv-cache] hit account=%s model=%s conversation=%s cached_msgs=%d new_msgs=%d", acc.ID, convCacheModel, cached.ConversationID, cached.MessageCount, len(body.Messages))
-				}
-			}
-		}
-	}
-	if !convReused && body.ConversationID == "" {
-		log.Printf("[conv-cache] miss account=%s model=%s", acc.ID, convCacheModel)
-	}
+	// 这里曾有一层 conv-cache：按 account+model+系统提示哈希缓存"上一个云端对话"，
+	// 命中就复用。它已被整体移除，因为在 sessionResolver 之后它不可能带来正当命中：
+	// 本分支只在 Resolve 未命中时才执行，而 Resolve 未命中意味着没有任何会话历史
+	// 构成当前消息的前缀——除了 Resolve 额外要求的 IP/UA 指纹一致这一条。
+	// 也就是说 conv-cache 唯一能补上的命中，恰好是指纹不一致的那些，
+	// 而那正是 sessionResolver 为防跨客户端串号故意拒绝的情形。
+	// 缓存键里没有任何客户端身份信息（同一 API key + 同一模型 + 同一系统提示
+	// 在多客户端下完全重合），保留它等于给串号开一个绕过身份隔离的旁路。
 
 	// Normalize tools once. Selection is always made by the upstream model;
 	// the gateway only validates its structured decision and converts protocols.
@@ -1354,7 +1348,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		// reused by the answer turn; delete it so the conversation list does
 		// not accumulate one entry per routed request.
 		if routeErr == nil && routeRes.ConversationID != "" {
-			s.dropTransientConversation(routeRes.ConversationID)
+			s.dropTransientConversation(acc.ID, routeRes.ConversationID)
 		}
 		if routeErr != nil {
 			s.accountPool.MarkFailure(acc.ID, routeErr, rateLimitCooldown)
@@ -1368,7 +1362,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 						acc = next
 						account = chathub.Account{AccessToken: next.AccessToken, OID: next.OID, TID: next.TID}
 						if routeRes.ConversationID != "" {
-							s.dropTransientConversation(routeRes.ConversationID)
+							s.dropTransientConversation(acc.ID, routeRes.ConversationID)
 						}
 					} else {
 						s.accountPool.MarkFailure(next.ID, err2, rateLimitCooldown)
@@ -1386,7 +1380,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		if !parsed {
 			repairRes, repairErr := s.chat.Chat(ctx, account, chathub.Request{Text: `Repair this tool routing output into JSON only with shape {"calls":[{"name":"function_name","arguments":{}}]}. Use {"calls":[]} if no tool is needed. OUTPUT:\n` + compactToolResult(routeRes.Text, 6000), Tone: tone, Attachments: body.Attachments})
 			if repairErr == nil && repairRes.ConversationID != "" {
-				s.dropTransientConversation(repairRes.ConversationID)
+				s.dropTransientConversation(acc.ID, repairRes.ConversationID)
 			}
 			if repairErr == nil {
 				calls, parsed = parseModelToolDecision(repairRes.Text, routeMaps, body.ToolChoice)
@@ -1544,9 +1538,6 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			log.Printf("[req-trace] id=%s stage=stream_error err=%v", requestID, err)
 			s.accountPool.MarkFailure(acc.ID, err, rateLimitCooldown)
-			if convReused {
-				s.invalidateConvCache(acc.ID, convCacheModel)
-			}
 			msg := upstreamError(err)
 			code := "upstream_error"
 			if IsRateLimited(err) {
@@ -1620,10 +1611,8 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			// The preamble already went out as content deltas, including the tail
 			// released just above. Re-sending it here would duplicate it.
 			_ = writeToolResponse(w, toolResponse{ID: id, Model: model, Stream: true, Calls: calls, Result: chathub.Result{Text: text.String()}, Prompt: answerPrompt, Options: body.StreamOptions})
-			if body.User != "" && res.ConversationID != "" {
-				s.userSessions.Put(body.User, res.ConversationID, res.SessionID, acc.ID)
-			}
-			s.bindConversation(acc, &body, r, res, answerPrompt, startedAt)
+			s.rememberUserSession(body.User, res, acc.ID)
+			s.bindConversation(acc, &body, r, res, answerPrompt, text.String(), startedAt)
 			return
 		}
 		// No call was produced. Whatever the gate still holds was only a
@@ -1659,10 +1648,8 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			_ = sseRaw(r.Context(), w, flusher, "data: "+mustJSON(finishChunk)+"\n\n")
 		}
 		_ = sseRaw(r.Context(), w, flusher, "data: [DONE]\n\n")
-		if body.User != "" && res.ConversationID != "" {
-			s.userSessions.Put(body.User, res.ConversationID, res.SessionID, acc.ID)
-		}
-		s.bindConversation(acc, &body, r, res, answerPrompt, startedAt)
+		s.rememberUserSession(body.User, res, acc.ID)
+		s.bindConversation(acc, &body, r, res, answerPrompt, text.String(), startedAt)
 		return
 	}
 	// Ask the upstream model to select and validate the next tool. The gateway
@@ -1827,9 +1814,6 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 		} else {
 			log.Printf("[req-trace] id=%s stage=stream_error err=%v", requestID, err)
 			s.accountPool.MarkFailure(acc.ID, err, rateLimitCooldown)
-			if convReused {
-				s.invalidateConvCache(acc.ID, convCacheModel)
-			}
 			msg := upstreamError(err)
 			code := "upstream_error"
 			if IsRateLimited(err) {
@@ -1899,22 +1883,17 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 	}
 	s.accountPool.MarkSuccess(acc.ID)
 	if body.Stream {
-		if body.User != "" && res.ConversationID != "" {
-			s.userSessions.Put(body.User, res.ConversationID, res.SessionID, acc.ID)
-		}
-		s.bindConversation(acc, &body, r, res, prompt, startedAt)
+		s.rememberUserSession(body.User, res, acc.ID)
+		s.bindConversation(acc, &body, r, res, prompt, res.Text, startedAt)
 		return
 	}
 
 	if body.SessionKey != "" {
 		s.sessions.upsert(conversation{ID: body.SessionKey, AccountID: acc.ID, ConversationID: res.ConversationID, SessionID: res.SessionID, Title: prompt})
 	}
-	if body.User != "" && res.ConversationID != "" {
-		s.userSessions.Put(body.User, res.ConversationID, res.SessionID, acc.ID)
-		log.Printf("[user-session] put user=%s conversation=%s session=%s", body.User, res.ConversationID, res.SessionID)
-	}
+	s.rememberUserSession(body.User, res, acc.ID)
 	if res.ConversationID != "" {
-		s.bindConversation(acc, &body, r, res, prompt, startedAt)
+		s.bindConversation(acc, &body, r, res, prompt, res.Text, startedAt)
 	}
 	if res.ConversationID != "" {
 		resolved := s.sessionResolver.Resolve(r, &body)
@@ -2079,14 +2058,35 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 
 const sessionHeaderName = "X-M365-Session-Id"
 
+// rememberUserSession 记录 user 字段到云端对话的映射，供后续同 user 的请求续接。
+// 这条路径不做任何内容校验：只要 user 相同就直接复用该对话，因此它是复用开关
+// 关闭时第一个要停掉的写入点——留下映射会让 auto_cleanup 把这些对话当成活跃条目
+// 保护起来，而它们永远不会再被复用。
+func (s *Server) rememberUserSession(user string, res chathub.Result, accountID string) {
+	if user == "" || res.ConversationID == "" || !conversationReuseEnabled() {
+		return
+	}
+	s.userSessions.Put(user, res.ConversationID, res.SessionID, accountID)
+	log.Printf("[user-session] put user=%s conversation=%s session=%s", user, res.ConversationID, res.SessionID)
+}
+
 // bindConversation 在请求完成后登记会话解析器索引与缓存统计，流式与非流式
 // 路径共用。会话为内容键，云端的对话由 auto_cleanup 按 2h 闲置窗口回收，
 // 这里不再做"用完即删"，否则复用永远不可能命中。
-func (s *Server) bindConversation(acc auth.AccountToken, body *oaiReq, r *http.Request, res chathub.Result, prompt string, startedAt time.Time) {
+//
+// prompt 与 answerText 必须分开传：prompt 是请求侧的 flatten 文本，用于标题与
+// 输入 token 计费；answerText 是模型这一轮的回复，会作为 assistant 消息追加进
+// 会话历史。两者混用会让历史末项变成请求文本的副本，客户端下一轮回传真实回复
+// 时前缀比对必然失配，内容键复用从此永不命中。
+func (s *Server) bindConversation(acc auth.AccountToken, body *oaiReq, r *http.Request, res chathub.Result, prompt, answerText string, startedAt time.Time) {
 	if res.ConversationID == "" {
 		return
 	}
-	s.sessionResolver.Bind("", res.ConversationID, acc.ID, body, prompt, r)
+	// 复用关闭时不写内容键绑定：这条记录唯一的用途就是被 Resolve 命中，
+	// 同时它还会让 auto_cleanup 把对话保护 2h。两者在关闭态下都是负担。
+	if conversationReuseEnabled() {
+		s.sessionResolver.Bind("", res.ConversationID, acc.ID, body, answerText, r)
+	}
 	s.conversationManager.Record(res.ConversationID, acc.ID, prompt)
 	if s.conversationManager.ShouldCleanup() {
 		if cleaned := s.conversationManager.Cleanup(); len(cleaned) > 0 {
@@ -2119,6 +2119,13 @@ func (s *Server) bindConversation(acc auth.AccountToken, body *oaiReq, r *http.R
 		DurationMs:   time.Since(startedAt).Milliseconds(),
 		Status:       200,
 	})
+
+	// 复用关闭时云端对话是一次性的：留着既不会被命中，又会在 auto_cleanup 的
+	// 30min 周期内无上限堆进 M365 历史列表（该行为本身就是风控触发点）。
+	// 调用方显式指定续接（session_key / X-M365-Session-Id）时不删，那是它要接着用的对话。
+	if !conversationReuseEnabled() && body.SessionKey == "" && r.Header.Get(sessionHeaderName) == "" {
+		s.dropTransientConversation(acc.ID, res.ConversationID)
+	}
 }
 
 // apiKeyContextKey carries the API key that authenticated the current request.

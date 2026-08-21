@@ -2,6 +2,7 @@ package web
 
 import (
 	"encoding/json"
+	"log"
 	"os"
 	"path/filepath"
 	"sync"
@@ -27,15 +28,30 @@ type sessionStore struct {
 	persist *persistStore
 }
 
+// openSessionStore 打开 session_key -> 云端对话的显式映射存储。
+//
+// 路径不能再取 M365_SESSION_CACHE：sessionResolver 用的是同一个变量，而两者的
+// 磁盘格式不兼容（这里是对象 map，那边是数组）。docker-compose 恰好设置了该
+// 变量，于是两个 store 指向同一文件、交替覆盖，各自加载对方格式时静默失败。
+// 这里改用独立的 M365_SESSION_KEY_CACHE，与 M365_DATA_DIR 对齐。
 func openSessionStore() *sessionStore {
-	path := os.Getenv("M365_SESSION_CACHE")
+	path := os.Getenv("M365_SESSION_KEY_CACHE")
 	if path == "" {
-		path = filepath.Join(os.TempDir(), "m365-copilot2api-sessions.json")
+		if dir := os.Getenv("M365_DATA_DIR"); dir != "" {
+			path = filepath.Join(dir, "session-keys.json")
+		} else {
+			path = filepath.Join(os.TempDir(), "m365-copilot2api-session-keys.json")
+		}
 	}
 	s := &sessionStore{path: path, data: map[string]conversation{}}
 	s.persist = &persistStore{flush: s.flush}
 	if b, err := os.ReadFile(path); err == nil {
-		_ = json.Unmarshal(b, &s.data)
+		if err := json.Unmarshal(b, &s.data); err != nil {
+			// 旧部署里这个文件可能是 sessionResolver 写的数组格式，解析失败
+			// 说明内容不属于本 store，从空表重新开始而不是带着半个 map 运行。
+			log.Printf("[session-store] ignoring unparsable cache %s: %v", path, err)
+			s.data = map[string]conversation{}
+		}
 	}
 	return s
 }
@@ -116,12 +132,19 @@ type userSessionStore struct {
 func openUserSessionStore(ttl time.Duration) *userSessionStore {
 	path := os.Getenv("M365_USER_SESSION_CACHE")
 	if path == "" {
-		path = filepath.Join(os.TempDir(), "m365-copilot2api-user-sessions.json")
+		if dir := os.Getenv("M365_DATA_DIR"); dir != "" {
+			path = filepath.Join(dir, "user-sessions.json")
+		} else {
+			path = filepath.Join(os.TempDir(), "m365-copilot2api-user-sessions.json")
+		}
 	}
 	s := &userSessionStore{path: path, data: map[string]userSession{}, ttl: ttl}
 	s.persist = &persistStore{flush: s.flush}
 	if b, err := os.ReadFile(path); err == nil {
-		_ = json.Unmarshal(b, &s.data)
+		if err := json.Unmarshal(b, &s.data); err != nil {
+			log.Printf("[user-session-store] ignoring unparsable cache %s: %v", path, err)
+			s.data = map[string]userSession{}
+		}
 	}
 	s.evictLocked()
 	return s

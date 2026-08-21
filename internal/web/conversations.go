@@ -102,9 +102,8 @@ func (s *Server) handleCacheStats(w http.ResponseWriter, r *http.Request) {
 	}
 	stats := cacheStats.GetStats()
 	jsonOut(w, map[string]any{
-		"object":     "cache_stats",
-		"stats":      stats,
-		"conv_cache": s.convCache.Stats(),
+		"object": "cache_stats",
+		"stats":  stats,
 	})
 }
 
@@ -122,20 +121,33 @@ func (s *Server) handleM365Conversations(w http.ResponseWriter, r *http.Request)
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	if m365CloudClient == nil && len(s.sessionResolver.ListSessions()) == 0 {
+	if !cloudConfigured() && len(s.sessionResolver.ListSessions()) == 0 {
 		writeOpenAIError(w, http.StatusServiceUnavailable, "m365_not_configured", "not_configured", "M365 cloud client not configured. Please add an M365 account first via PKCE authorization.")
 		return
 	}
 	rows := make(map[string]map[string]any)
 	var cloudErr error
-	if m365CloudClient != nil {
-		var chats []map[string]any
-		chats, cloudErr = m365CloudClient.ListConversations()
+	// 逐账号列举：每个账号只能看到自己的云端对话列表。
+	for _, accountID := range m365CloudClients.AccountIDs() {
+		client, ok := m365CloudClients.Get(accountID)
+		if !ok {
+			continue
+		}
+		chats, err := client.ListConversations()
+		if err != nil {
+			cloudErr = err
+			continue
+		}
 		for _, chat := range chats {
 			conversationID, _ := chat["conversationId"].(string)
-			if conversationID != "" {
-				rows[conversationID] = chat
+			if conversationID == "" {
+				continue
 			}
+			chat["accountId"] = accountID
+			if account, found := s.tokens.Get(accountID); found {
+				chat["accountEmail"] = account.Email
+			}
+			rows[conversationID] = chat
 		}
 	}
 	if cloudErr != nil && len(s.sessionResolver.ListSessions()) == 0 {
@@ -156,6 +168,9 @@ func (s *Server) handleM365Conversations(w http.ResponseWriter, r *http.Request)
 		row["updateTimeUtc"] = session.LastUsedAt.UnixMilli()
 		row["messageCount"] = len(session.ContextHistory)
 		row["historyAvailable"] = len(session.ContextHistory) > 0
+		// 截断会话的 messageCount 只是尾部片段的条数，不是对话真实长度；
+		// 也不参与内容键复用。标出来避免界面上把它当完整历史读。
+		row["historyTruncated"] = session.HistoryTruncated
 		row["source"] = "gateway"
 		if account, found := s.tokens.Get(session.AccountID); found {
 			row["accountEmail"] = account.Email
@@ -209,6 +224,8 @@ func (s *Server) handleM365ConversationDetail(w http.ResponseWriter, r *http.Req
 		"updatedAt":      session.LastUsedAt,
 		"messageCount":   len(session.ContextHistory),
 		"messages":       session.ContextHistory,
+		// 超长对话只留了尾部片段，调用方需要知道这不是完整历史。
+		"historyTruncated": session.HistoryTruncated,
 	})
 }
 
@@ -250,18 +267,31 @@ func (s *Server) handleM365Delete(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	if m365CloudClient == nil {
+	if !cloudConfigured() {
 		writeOpenAIError(w, http.StatusServiceUnavailable, "m365_not_configured", "not_configured", "M365 cloud client not configured. Please add an M365 account first via PKCE authorization.")
 		return
 	}
 	var body struct {
 		ConversationID string `json:"conversation_id"`
+		AccountID      string `json:"account_id"`
 	}
 	if json.NewDecoder(r.Body).Decode(&body) != nil || body.ConversationID == "" {
 		http.Error(w, "bad json", http.StatusBadRequest)
 		return
 	}
-	if err := m365CloudClient.DeleteConversation(body.ConversationID); err != nil {
+	// 用创建该对话的账号去删：换成别的账号的 token 会直接失败。调用方给出的
+	// account_id 优先（列表接口已标注归属），本地索引仅作兜底——重启后
+	// conversationManager 可能已经没有这条记录，但云端对话还在。
+	accountID := body.AccountID
+	if accountID == "" {
+		accountID = s.conversationAccount(body.ConversationID)
+	}
+	client, ok := cloudClientFor(accountID)
+	if !ok {
+		writeOpenAIError(w, http.StatusServiceUnavailable, "m365_not_configured", "not_configured", "no M365 account can operate cloud conversations")
+		return
+	}
+	if err := client.DeleteConversation(body.ConversationID); err != nil {
 		writeOpenAIError(w, http.StatusBadGateway, "m365_error", "m365_api_error", err.Error())
 		return
 	}
@@ -274,7 +304,7 @@ func (s *Server) handleM365Cleanup(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	if m365CloudClient == nil {
+	if !cloudConfigured() {
 		writeOpenAIError(w, http.StatusServiceUnavailable, "m365_not_configured", "not_configured", "M365 cloud client not configured. Please add an M365 account first via PKCE authorization.")
 		return
 	}
@@ -293,12 +323,48 @@ func (s *Server) handleM365Cleanup(w http.ResponseWriter, r *http.Request) {
 		keepN = 5
 	}
 
-	deleted, err := m365CloudClient.CleanupOldConversations(maxAge, keepN)
-	if err != nil {
-		writeOpenAIError(w, http.StatusBadGateway, "m365_error", "m365_api_error", err.Error())
+	// keepN 是每账号的保留额度：各账号的云端列表互不可见，无法做全局排序。
+	total := 0
+	var lastErr error
+	for _, accountID := range m365CloudClients.AccountIDs() {
+		client, ok := m365CloudClients.Get(accountID)
+		if !ok {
+			continue
+		}
+		deleted, err := client.CleanupOldConversations(maxAge, keepN)
+		total += deleted
+		if err != nil {
+			lastErr = err
+		}
+	}
+	if lastErr != nil && total == 0 {
+		writeOpenAIError(w, http.StatusBadGateway, "m365_error", "m365_api_error", lastErr.Error())
 		return
 	}
-	jsonOut(w, map[string]any{"status": "cleaned", "deleted": deleted})
+	out := map[string]any{"status": "cleaned", "deleted": total}
+	if lastErr != nil {
+		out["warning"] = lastErr.Error()
+	}
+	jsonOut(w, out)
+}
+
+// conversationAccount 查出某个云端对话属于哪个账号，用于把删除请求路由到正确的
+// 客户端。本地索引查不到时返回空串，由调用方退回任意可用客户端。
+func (s *Server) conversationAccount(conversationID string) string {
+	for _, c := range s.conversationManager.List() {
+		if c.ID == conversationID && c.AccountID != "" {
+			return c.AccountID
+		}
+	}
+	if sess, ok := s.sessionResolver.GetConversation(conversationID); ok {
+		return sess.AccountID
+	}
+	for _, c := range s.sessions.list() {
+		if c.ConversationID == conversationID && c.AccountID != "" {
+			return c.AccountID
+		}
+	}
+	return ""
 }
 
 func (s *Server) handleSessionDelete(w http.ResponseWriter, r *http.Request) {
